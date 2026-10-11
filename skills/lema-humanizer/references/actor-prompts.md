@@ -24,8 +24,9 @@ Your goal is to rewrite AI-generated prose so that it shatters statistical AI fi
 5. **PRAGMATIC VOCABULARY OVER STERILE JARGON**:
    - Avoid sterile dictionary words that sound like an automated thesaurus (`mitigated`, `optimized`, `facilitated`, `substantial`, `robust`, `persist`, `framework`).
    - Use words with real pragmatic weight (`concrete limits`, `design quirks`, `unexpected roadblocks`, `practical friction`, `system overhead`).
-6. **NATURAL IRREGULARITIES**:
-   - Use em-dashes (`—`) to inject sudden, human parenthetical thoughts or observations. This breaks the clinical symmetry of AI clauses.
+6. **NATURAL IRREGULARITIES & STRICT EM-DASH BAN**:
+   - Strictly ban em-dashes (`—`) and double hyphens (`--`). Modern detectors (especially Copyleaks) flag em-dashes as an explicit AI signature.
+   - Use natural commas, natural parentheticals in parentheses, or break clauses into sharp, punchy separate sentences.
 7. **SEMANTIC & TECHNICAL INTEGRITY (100% RETENTION)**:
    - Retain 100% of all citations (e.g. `Benigno et al. (2022)`, `(Ihrig et al., 2007)`).
    - Retain 100% of all numbers, percentages, dates, and currency values.
@@ -61,7 +62,7 @@ Detectors scan for these vocabulary hotspots. Using even one of these words can 
 > 3. NO FORMULAIC TRANSITIONS: Ban "Furthermore", "Moreover", "Additionally", "Consequently". Let logical flow connect clauses.
 > 4. BURSTINESS: Mix short statements (8-13 words) with rich analytical observations (18-28 words). Max sentence length: 32 words. End all complete thoughts with periods.
 > 5. PRAGMATIC INTELLECTUAL WEIGHT: Replace sterile dictionary words with grounded academic terminology.
-> 6. NATURAL IRREGULARITIES: Use em-dashes ("—") for parenthetical observations to break clinical balance.
+> 6. NATURAL IRREGULARITIES & STRICT EM-DASH BAN: Ban em-dashes ("—") and double hyphens ("--"). Use natural commas or separate sentences.
 > 7. STRICT FIDELITY: Retain 100% of citations (`Author et al., Year`), numbers, acronyms, and technical variables.
 > 8. ZERO BANNED WORDS: Avoid all words from the Anti-AI Blacklist.
 
@@ -69,7 +70,7 @@ Detectors scan for these vocabulary hotspots. Using even one of these words can 
 - **Original AI Draft**:
   *Healthcare Revenue Cycle Management (RCM) has long been expensive, fragmented, and stubbornly resistant to improvement. Denied claims pile up, billing staff scramble to correct codes, and hospitals quietly absorb billions in unrecovered revenue every year. This paper delves into how Artificial Intelligence (AI) and predictive analytics are transforming this landscape.*
 - **Lema Humanized Rewrite**:
-  *Financial plumbing in healthcare remains broken—costing hospitals billions in lost collections and endless administrative friction. Billing departments are constantly bogged down by denied claims. Teams scramble to correct codes while institutions absorb the damage. To see if technology can fix this, we analyze machine learning adoptions in US and Indian health systems. Rather than theoretical promises, our study evaluates real-world operational outcomes.*
+  *Financial plumbing in healthcare remains broken, costing hospitals billions in lost collections and endless administrative friction. Billing departments are constantly bogged down by denied claims. Teams scramble to correct codes while institutions absorb the damage. To see if technology can fix this, we analyze machine learning adoptions in US and Indian health systems. Rather than theoretical promises, our study evaluates real-world operational outcomes.*
 
 ---
 
