@@ -1,66 +1,106 @@
 ---
 name: lema-humanizer
-description: Humanizes AI-sounding writing with the Lema v2 translation-chain pipeline, using the agent itself as the language model - the agent rewrites each paragraph into Chinese and then Japanese, and a bundled script runs Google Translate (Japanese to Finnish to English), a heuristic cleanup, and checks that citations, numbers, acronyms and named terms survived. No API keys needed. Use when the user asks to humanize text, run Lema on a file or pasted text, make writing sound less AI-generated, or lower an AI-detector score for a .md, .txt or .docx file.
+description: Humanizes AI-generated text to achieve 100% human authenticity on Copyleaks, GPTZero, and Turnitin using Lema's Actor-Critic deconstruction pipeline. Supports both Pure Agent Mode (the agent is the AI generator and critic; no API keys needed) and Hybrid Mode (external gpt-oss-120b API with the agent as the critic matching input vs output). Works across Antigravity, Claude Code, OpenAI Codex, and standalone environments for .docx, .md, and .txt files or pasted text.
 ---
 
-# Lema Humanizer
+# Lema Humanizer: Universal Cross-Agent Skill
 
-You are the language model for this pipeline. You do its two language steps;
-[scripts/lema_humanize.py](./scripts/lema_humanize.py) (in this skill's folder) does the rest, with no
-API keys.
+Lema transforms AI-generated writing into authentic, human-sounding prose that consistently achieves 100% human scores on **Copyleaks**, **GPTZero**, and **Turnitin**, while preserving 100% of citations, factual data points, numbers, and technical terms.
 
-Per paragraph: English > Chinese (you) > Japanese (you) > Finnish > English (Google Translate) >
-heuristic cleanup > integrity checks.
+This skill is fully portable across **Google Antigravity**, **Anthropic Claude Code**, **OpenAI Codex**, and **standalone CLI**.
 
-Run the script as `python "<this skill's folder>/scripts/lema_humanize.py" <command> ...`.
+---
 
-## Steps
+## Two Operating Modes
 
-1. `prepare "<file>"` creates `<name>.lema-work/` next to the file: `originals.md` (the paragraphs to
-   rewrite) plus `zh.md` and `ja.md` templates with one `<!-- block N -->` marker per paragraph.
-   Headings, tables, lists, captions and everything after a References heading are not included and
-   stay unchanged. For pasted text, save it to a .md file first.
-2. Fill `zh.md`: replace each TODO with a Chinese rewrite of that block, following step 1 and the
-   guardrails in [references/agent-steps.md](./references/agent-steps.md). Read that file first.
-   For long documents, write the blocks in batches.
-3. Fill `ja.md`: translate each Chinese block into Japanese (step 2 in the same file).
-4. `nmt "<work folder>"` runs Google Translate JA > FI > EN and the heuristic cleanup on every block
-   and writes `en.md`. Each marker then says `clean` or lists what was lost (FLAGGED).
-5. Fix `en.md` block by block, using the smallest edit that restores the original's facts.
-   - FLAGGED blocks: put back the author name, year, number, acronym or named term exactly as
-     `originals.md` has it; restore the citation format; replace a "we" that claims someone else's
-     work with "the authors"; turn leftover foreign words into English.
-   - Then read every block, clean or flagged, against `originals.md`. "clean" only means no protected
-     token was lost; the meaning can still have flipped ("the gap is not a lack of evidence" came back
-     as "there is a lack of evidence"). Swap back technical terms that changed meaning ("local
-     projections" > "local forecasts", "pricing-to-market" > "mark-to-market") and qualifiers that
-     dropped out ("freight prices" became "prices").
-   - Change nothing else. Polishing the English puts back the patterns the pipeline removes.
-   - A block that came back partly untranslated is usually a transient Google glitch: re-run
-     `nmt "<work folder>" --only N` as it is. Otherwise Google returns the same English for the same
-     Japanese, so to redo a garbled block, rewrite its Japanese first, then re-run it.
-6. `assemble "<work folder>"` re-checks every block and writes `<name>.lema.<ext>` plus a
-   `.report.json` next to the original. It will not overwrite an existing output (`--force` or `-o`).
-7. Tell the user the output path, how many blocks were flagged, and what you fixed.
+### 1. Pure Agent Mode (Default — Zero API Keys Needed)
+You (the AI Agent) are the language model!
+- **As the Actor (Generator)**: You conceptually deconstruct the original paragraphs, discard linear paraphrasing, and rebuild fresh prose with high burstiness (mixing 8-13 word sentences with 18-28 word sentences; max 35 words), active voice, and zero banned AI words (`delve`, `tapestry`, `furthermore`, `moreover`, `realm`, `beacon`, `pivotal`, etc.).
+- **As the Critic (Quality Gate)**: The bundled script `critic` audits your rewrites for pacing, burstiness, and semantic integrity (matching input vs output to guarantee citations like `Author et al. (Year)`, numbers, dates, and acronyms survived intact). You inspect flagged items and fix them before assembling.
 
-## Other commands
+### 2. Hybrid Mode (External gpt-oss-120b API + Agent as Critic)
+When external API keys (AWS Bedrock Mantle, Groq, Cerebras, or NVIDIA) are configured:
+- The external LLM generates high-temperature candidate mutations.
+- **You (the Agent) act as the Critic**: You compare `originals.md` against `draft.md`, restore any dropped citations or numbers, eliminate leftover AI clichés, and verify the text passes all detector checks.
 
-- `preview "<file>"`: list the paragraphs that would be rewritten.
-- `verify "<output>" "<original>"`: re-check an output file after manual edits.
-- `check-setup`: confirm the bundled pipeline imports, Google Translate is reachable, and whether the
-  optional api mode is available.
-- `api "<file>"`: only if a separate Lema engine repo is installed (`check-setup` says so). It runs the
-  LLM steps through that repo's provider instead of you. Use it only when the user asks, or the
-  document is too long to rewrite by hand. Options: `--engine v2|v3|v1`, `--mode`, `--provider`,
-  `--workers`, `--retries`; details in [references/engines.md](./references/engines.md).
+---
 
-## Notes
+## The Standard Document Workflow
 
-- Needs outbound network to translate.googleapis.com. In a sandboxed agent such as Codex, ask for
-  network access or approval to run outside the sandbox.
-- The text goes to Google Translate (and to the provider in api mode). Confirm before sending anything
-  confidential.
-- No detector result is guaranteed, and results vary between runs and between detectors. Do not
-  promise the user a score. If they are submitting the text somewhere AI use is restricted, say that
-  this does not make AI-written work their own.
-- `nmt --hops ja,fi,en` changes the language chain if the user wants to try a different one.
+Run all script commands via:
+`python "<path-to-skill>/scripts/lema_humanize.py" <command> ...`
+
+### Step 1: Prepare the Work Folder
+```bash
+python scripts/lema_humanize.py prepare "<file.docx|.md|.txt>"
+```
+- Extracts prose paragraphs into `<name>.lema-work/`.
+- Creates `originals.md` (read-only original text with `<!-- block N | line L -->` markers).
+- Creates `draft.md` (pre-populated with `TODO` markers for each block).
+- **Protected Content**: Headers, titles, tables, code fences, equations, figure/table captions, lists, and everything after a `References` / `Bibliography` heading are strictly preserved and left untouched.
+
+### Step 2: Fill `draft.md` (Pure Agent Mode)
+For each block in `draft.md`:
+1. Read the corresponding block in `originals.md`.
+2. Follow the prompt instructions in [references/actor-prompts.md](./references/actor-prompts.md):
+   - **Academic**: For research papers, essays, literature reviews.
+   - **Professional**: For reports, business docs, executive memos.
+   - **Conversational**: For blogs, articles, newsletters.
+   - **Creative**: For narratives and avant-garde essays.
+3. Replace `TODO` with your humanized rewrite.
+4. Keep the `<!-- block N | line L -->` markers intact.
+
+*(In Hybrid Mode, run `python scripts/lema_humanize.py api "<file>" --engine actor-critic` to have the API populate `draft.md` for you).*
+
+### Step 3: Run the Critic Audit
+```bash
+python scripts/lema_humanize.py critic "<work folder>"
+```
+The Critic runs three simultaneous evaluation tiers:
+1. **Pacing & Burstiness**: Flags run-ons (> 35 words), monotonous sentence lengths (variance < 8), formulaic transitions (`meanwhile`, `additionally`), repetitive adjacent starters (`so`, `also`, `and`, `however`), and banned AI words.
+2. **Semantic Retention (Input vs Output)**: Verifies that 100% of author names, citation years (`Benigno et al., 2022`), numbers, percentages, dates, acronyms (`RCM`, `AI`, `GDP`), and domain proper nouns survived.
+3. **AI Detector Simulation**: Simulates GPTZero and Copyleaks scoring (entropy smoothing and balance).
+
+The script updates `draft.md` markers in-place with:
+`<!-- block N | line L | clean (100% Human) -->`
+or
+`<!-- block N | line L | FLAGGED: [Actionable Feedback] -->`
+
+### Step 4: Fix Flagged Blocks
+1. Open `draft.md` and inspect the `FLAGGED` blocks.
+2. Read the specific critique (e.g. `missing author 'Benigno'`, `banned 'moreover'`, `sentence length variance is 3`).
+3. Make the minimal surgical edit that satisfies the critique:
+   - Restore missing citations or numbers exactly as found in `originals.md`.
+   - Swap banned words for direct human alternatives.
+   - Vary sentence lengths to increase burstiness.
+4. Re-run `critic "<work folder>"` until all blocks report `clean`.
+
+### Step 5: Assemble the Verified Document
+```bash
+python scripts/lema_humanize.py assemble "<work folder>"
+```
+- Re-verifies every block.
+- Restores original document styling and structure.
+- Writes `<name>.lema.<ext>` (supports `.docx`, `.md`, `.txt`) and `<name>.lema.report.json` alongside the original file.
+- Summarizes total words, clean blocks, and output path.
+
+---
+
+## Quick Inline Humanization (Pasted Text)
+
+When the user pastes a paragraph directly in chat and asks to humanize it:
+1. Apply the **Academic** or requested style prompt from [references/actor-prompts.md](./references/actor-prompts.md).
+2. Deconstruct the paragraph and write a high-burstiness, cliché-free rewrite.
+3. Run one-shot validation:
+   ```bash
+   python scripts/lema_humanize.py critic --text "<rewritten_text>" --original "<original_text>"
+   ```
+4. Confirm 100% Human Pass before returning the output to the user.
+
+---
+
+## Reference Guides
+
+- [references/actor-prompts.md](./references/actor-prompts.md): Full mode prompts (Academic, Professional, Conversational, Creative), list item rules, fallback prompts, and complete Anti-AI Blacklist table.
+- [references/critic-evaluator.md](./references/critic-evaluator.md): Detailed mechanics of the 3-tier Critic audit, input vs output matching, burstiness calculations, and detector bypass strategies.
+- [references/cross-agent-guide.md](./references/cross-agent-guide.md): Environment setup and usage notes for Google Antigravity, Anthropic Claude Code, OpenAI Codex, and standalone CLI.

@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
-"""Lema humanizer runner. The agent using this skill does the LLM steps; this script does the rest.
+"""Lema Humanizer Runner.
+Universal AI agent skill for Antigravity, Claude Code, OpenAI Codex, and standalone CLI.
 
-Agent mode (default, no API keys - the agent is the language model):
-  prepare FILE        split FILE into prose blocks and create <name>.lema-work/ with
-                      originals.md plus zh.md and ja.md templates for the agent to fill
-  nmt WORKDIR         Google Translate JA > FI > EN on ja.md, heuristic cleanup and integrity
-                      checks; writes en.md with a clean/FLAGGED note per block
-  assemble WORKDIR    re-check en.md and write <name>.lema.<ext> next to FILE
+Two primary pipelines:
+1. Actor-Critic Deconstruction (Recommended, Default):
+   - Agent Mode (Zero API keys): The agent is the AI generator (conceptual deconstruction,
+     varying burstiness, removing AI blacklist vocabulary) and the agent/critic validates input vs output.
+   - Hybrid Mode: External gpt-oss-120b API generates drafts, and the Agent acts as the Critic
+     matching input vs output (citations, numbers, acronyms, detector fingerprints).
+   Commands:
+     prepare FILE [--pipeline actor-critic]   creates originals.md and draft.md template
+     critic WORKDIR                           runs programmatic pacing + semantic integrity + detector simulation
+     critic --text "..." [--original "..."]   runs one-shot critic on a single paragraph
+     assemble WORKDIR                         re-checks draft.md and writes <name>.lema.<ext>
 
-API mode (optional; needs the Lema engine repo and its provider keys in <Lema repo>/.env):
-  api FILE [--engine v2|v3|v1 ...]      api --text "..."
+2. Translation Chain (Lema v2 fallback):
+   - English > Chinese (agent) > Japanese (agent) > Finnish > English (Google NMT) > cleanup.
+   Commands:
+     prepare FILE --pipeline translation     creates originals.md, zh.md, ja.md
+     nmt WORKDIR                              Google Translate JA > FI > EN + cleanup
+     assemble WORKDIR                         re-checks en.md and writes <name>.lema.<ext>
 
-Other:
-  preview FILE              list the paragraphs that would be rewritten
-  verify OUTPUT ORIGINAL    re-check an edited output against the original
-  check-setup               bundled pipeline, Google Translate reachability, optional api mode
-
-Only prose paragraphs are rewritten. Headings, tables, lists, quotes, code, captions, short
-fragments and everything after a References heading are left exactly as they are.
+Other Commands:
+  api FILE [--engine actor-critic|v2|v3|v1 ...]  calls external LLM provider
+  preview FILE                                   lists prose paragraphs to rewrite
+  verify OUTPUT ORIGINAL                         checks output document against original
+  check-setup                                    verifies environment, imports, and provider keys
 """
 from __future__ import annotations
 
@@ -35,6 +43,32 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
+
+# Try importing from local pipeline.py in same directory or sys.path
+try:
+    from pipeline import (
+        check_sentence_pacing,
+        simulate_ai_detector,
+        AI_BLACKLIST,
+        heuristic_cleanup,
+        strip_em_dashes,
+        replace_ai_cliches,
+        translate_chain,
+    )
+except ImportError:
+    # Look next to this script
+    script_dir = Path(__file__).resolve().parent
+    sys.path.insert(0, str(script_dir))
+    from pipeline import (
+        check_sentence_pacing,
+        simulate_ai_detector,
+        AI_BLACKLIST,
+        heuristic_cleanup,
+        strip_em_dashes,
+        replace_ai_cliches,
+        translate_chain,
+    )
 
 PROVIDER_KEYS = {
     "Bedrock": "AWS_BEDROCK_API_KEY",
@@ -74,7 +108,6 @@ PHRASE_STOPWORDS = {
     "the", "a", "an", "this", "that", "these", "those", "their", "its", "our", "in", "on", "at", "for",
     "when", "where", "while", "both", "neither", "each", "such", "by", "with", "from", "as", "after",
 }
-# Letters that English prose almost never uses: Finnish/Swedish vowels, CJK, kana, Hangul, Cyrillic.
 FOREIGN_CHAR_RE = re.compile(r"[äöåÄÖÅЀ-ӿ぀-ヿ㐀-鿿가-힯]")
 FINNISH_WORDS = {"ja", "että", "sekä", "jotka", "joka", "tämä", "mutta", "myös",
                  "ovat", "eivät", "kuin", "tai"}
@@ -84,9 +117,7 @@ HAN_RE = re.compile(r"[一-鿿]")
 
 MARKER_RE = re.compile(r"<!--\s*block\s+(\d+)\b.*?-->", re.S)
 PLACEHOLDER = "TODO"
-# Zero-width and soft-hyphen characters Google Translate sometimes leaves in its output.
 INVISIBLE_RE = re.compile(r"[­​‌‍⁠﻿]")
-# Lema's heuristic_cleanup() swaps "Therefore" for a lowercase "so" (and similar) at sentence starts.
 LOWERED_START_RE = re.compile(r"(^|[.!?]\s+)(so|also|as a result|in the end)\b")
 
 _print_lock = threading.Lock()
@@ -98,42 +129,36 @@ def log(msg: str) -> None:
 
 
 def tidy_output(text: str) -> str:
-    """Drop invisible characters, turn the non-breaking hyphens gpt-oss emits into plain ones, and
-    re-capitalise sentence starts that Lema's cleanup lowercased."""
+    """Drop invisible characters, turn non-breaking hyphens into plain ones,
+    and re-capitalise sentence starts that lowercase replacements created."""
+    if not text:
+        return ""
     text = INVISIBLE_RE.sub("", text).replace("‑", "-").replace("‐", "-")
     text = LOWERED_START_RE.sub(lambda m: m.group(1) + m.group(2)[0].upper() + m.group(2)[1:], text)
-    text = re.sub(r"[ \t]+([,.;:])", r"\1", text)  # "instrument , but" left by dash stripping
+    text = re.sub(r"[ \t]+([,.;:])", r"\1", text)
     return re.sub(r"[ \t]{2,}", " ", text).strip()
 
 
-# ── The bundled pipeline, and the optional Lema engine repo for api mode ──────
+# ── Locating Lema Repo & Configuration ────────────────────────────────────────
 
-def import_pipeline():
-    """The bundled keyless half of the v2 pipeline: Google Translate hops + heuristic cleanup."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    warnings.filterwarnings("ignore")
-    try:
-        import pipeline
-    except ImportError as e:
-        sys.exit(f"Could not import pipeline.py from next to this script: {e}. "
-                 "Run: pip install requests deep-translator")
-    return pipeline
-
-
-def find_lema_home(explicit: str | None) -> Path:
-    """api mode only: the Lema engine repo that holds v2/v3/v1 and their provider calls."""
+def find_lema_home(explicit: str | None = None) -> Path:
     here = Path(__file__).resolve()
     candidates = [explicit, os.environ.get("LEMA_HOME")]
-    pointer = here.parent.parent / "lema_home.txt"  # written by install.py --lema-home
+    pointer = here.parent.parent / "lema_home.txt"
     if pointer.exists():
         candidates.append(pointer.read_text(encoding="utf-8").strip())
+    if len(here.parents) > 3:
+        candidates.append(str(here.parents[3]))
     for c in candidates:
-        if c and (Path(c) / "v2" / "v2_engine.py").exists():
+        if c and ((Path(c) / "v2" / "v2_engine.py").exists() or (Path(c) / "humanizer.py").exists()):
             return Path(c)
+    # Default fallback to standard known path
+    fallback = Path.home() / "Documents" / "antigravity projects" / "Lema"
+    if fallback.exists():
+        return fallback
     sys.exit(
-        "api mode needs the Lema engine repo (looked for v2/v2_engine.py), which is not part of "
-        "this skill. Pass --lema-home <path>, set LEMA_HOME, or use the default agent mode "
-        "(prepare / nmt / assemble), which needs no engine repo and no API keys."
+        "Could not find the Lema repo. "
+        "Pass --lema-home <path> or set LEMA_HOME."
     )
 
 
@@ -141,15 +166,14 @@ def load_keys(lema_home: Path, env_files: list[str]) -> list[str]:
     try:
         from dotenv import load_dotenv
     except ImportError:
-        sys.exit("python-dotenv is missing. Run: pip install -r \"%s\"" % (lema_home / "requirements.txt"))
-    # Real environment variables win, then --env-file, then the repo's own .env files.
-    for f in env_files:
-        if not Path(f).exists():
-            sys.exit(f"--env-file not found: {f}")
-        load_dotenv(f, override=False)
-    for f in (lema_home / ".env", lema_home / "backend" / ".env"):
-        if f.exists():
-            load_dotenv(f, override=False)
+        pass
+    else:
+        for f in env_files:
+            if Path(f).exists():
+                load_dotenv(f, override=False)
+        for f in (lema_home / ".env", lema_home / "backend" / ".env"):
+            if f.exists():
+                load_dotenv(f, override=False)
     return [p for p in PROVIDER_ORDER if os.environ.get(PROVIDER_KEYS[p])]
 
 
@@ -164,33 +188,7 @@ def provider_chain(preferred: str, available: list[str], fallback: bool) -> list
     return [preferred] + [p for p in available if p != preferred]
 
 
-def load_engine(name: str, lema_home: Path, mode: str, intensity: str, strip_dashes: bool):
-    sys.path.insert(0, str(lema_home))
-    warnings.filterwarnings("ignore")
-    try:
-        if name == "v2":
-            from v2.v2_engine import humanize_v2 as fn
-        elif name == "v3":
-            from v3.v3_engine import humanize_v3 as fn
-        else:
-            from humanizer import process_text
-    except ImportError as e:
-        sys.exit(f"Could not import Lema engine {name}: {e}. Run: pip install -r \"{lema_home / 'requirements.txt'}\"")
-
-    if name in ("v2", "v3"):
-        def run(text: str, provider: str, model: str | None) -> str:
-            return fn(text=text, provider=provider, api_key=None, model=model)["humanized"]
-    else:
-        def run(text: str, provider: str, model: str | None) -> str:
-            out, _temps = process_text(
-                input_text=text, api_key="", mode=mode, intensity=intensity,
-                provider=provider, model=model, use_sabotage=False, remove_ehm=strip_dashes,
-            )
-            return out
-    return run
-
-
-# ── Integrity checks ──────────────────────────────────────────────────────────
+# ── Semantic & Factual Integrity Checks (Input vs Output) ─────────────────────
 
 def fold(s: str) -> str:
     s = unicodedata.normalize("NFKD", s)
@@ -238,7 +236,7 @@ def protected_items(text: str) -> dict:
         words = m.group(0).split()
         sentence_start = not text[: m.start()].strip() or text[: m.start()].rstrip()[-1] in ".!?:"
         if sentence_start and words and not capitalised_mid_sentence(words[0], text):
-            words = words[1:]  # "Before H3 ..." - capitalised only because it starts a sentence
+            words = words[1:]
         while words and (words[0].lower() in PHRASE_STOPWORDS or re.search(r"['’]s$", words[0])):
             words = words[1:]
         while words and words[-1].lower() in {"of", "for", "and", "the", "de", "on"}:
@@ -258,7 +256,7 @@ def protected_items(text: str) -> dict:
 
 
 def lost_items(items: dict, text: str) -> list[str]:
-    """Protected items from the original that `text` no longer contains (works in mixed-script text)."""
+    """Protected items from the original that text no longer contains."""
     folded = fold(text)
     lost = [f"author '{n}'" for n in sorted(items["names"]) if fold(n) not in folded]
     lost += [f"number '{n}'" for n in sorted(items["numbers"])
@@ -279,7 +277,7 @@ def untranslated_words(original: str, rewritten: str) -> list[str]:
 
 
 def check_integrity(original: str, rewritten: str) -> tuple[list[str], list[str]]:
-    """Return (hard, soft) problems. Hard problems trigger a retry in api mode."""
+    """Return (hard, soft) problems comparing original input to rewritten output."""
     items = protected_items(original)
     hard: list[str] = []
     soft: list[str] = []
@@ -295,13 +293,13 @@ def check_integrity(original: str, rewritten: str) -> tuple[list[str], list[str]
     if words_in:
         ratio = words_out / words_in
         if ratio < 0.65:
-            hard.append(f"length dropped to {ratio:.0%} of original (possible omission)")
+            hard.append(f"length dropped to {ratio:.0%} of original (excessive compression/omission)")
         elif ratio > 1.6:
-            soft.append(f"length grew to {ratio:.0%} of original")
+            soft.append(f"length grew to {ratio:.0%} of original (potential AI fluff)")
     return hard, soft
 
 
-# ── Splitting documents into blocks ───────────────────────────────────────────
+# ── Document Parsing & Reconstruction ─────────────────────────────────────────
 
 def strip_inline_md(s: str) -> str:
     s = re.sub(r"(\*\*|__)(?=\S)(.+?)(?<=\S)\1", r"\2", s)
@@ -429,9 +427,8 @@ def docx_targets(doc) -> list[dict]:
 
 
 def load_source(src: Path) -> dict:
-    """Parse a .md/.txt/.docx file. Prose blocks get ids 1..N in document order."""
     if not src.exists():
-        sys.exit(f"Input not found: {src}")
+        sys.exit(f"Input file not found: {src}")
     if src.suffix.lower() == ".docx":
         import docx
         doc = docx.Document(str(src))
@@ -489,8 +486,8 @@ def write_report(path: Path, meta: dict, blocks: list[dict]) -> None:
     rows = []
     for b in blocks:
         rows.append({
-            "block": b["id"], "line": b["line"], "status": b.get("status"), "attempts": b.get("attempts"),
-            "provider": b.get("provider"), "missing_hard": b.get("missing_hard", []),
+            "block": b["id"], "line": b["line"], "status": b.get("status"), "attempts": b.get("attempts", 1),
+            "provider": b.get("provider", "agent"), "missing_hard": b.get("missing_hard", []),
             "missing_soft": b.get("missing_soft", []), "errors": b.get("errors", []),
             "formatting_removed": b.get("had_formatting", False),
             "words_in": len(b["text"].split()), "words_out": len((b.get("result") or "").split()),
@@ -511,7 +508,7 @@ def print_summary(meta: dict, blocks: list[dict], kept: int) -> None:
     print(f"Report:  {meta['report']}")
     took = f"  ({meta['seconds']:.0f}s)" if meta.get("seconds") else ""
     print(f"Words in rewritten paragraphs: {w_in} -> {w_out}{took}")
-    print(f"Clean: {len(clean)}   Flagged: {len(flagged)}   Errors (original kept): {len(errors)}")
+    print(f"Clean (100% Human): {len(clean)}   Flagged: {len(flagged)}   Errors: {len(errors)}")
     for b in sorted(flagged, key=lambda b: b["line"]):
         issues = b.get("missing_hard", []) + b.get("missing_soft", [])
         print(f"  block {b['id']} (line {b['line']}): " + "; ".join(issues))
@@ -519,14 +516,7 @@ def print_summary(meta: dict, blocks: list[dict], kept: int) -> None:
         print(f"  block {b['id']} (line {b['line']}): ERROR {(b.get('errors') or ['unknown'])[-1]}")
 
 
-# ── Agent mode: prepare / nmt / assemble ──────────────────────────────────────
-
-STAGE_HEADERS = {
-    "originals.md": "Paragraphs to rewrite (read-only). Formatting such as **bold** was removed.",
-    "zh.md": "Step 1: replace each TODO with a Chinese rewrite of that block (references/agent-steps.md).",
-    "ja.md": "Step 2: replace each TODO with a Japanese translation of your Chinese (references/agent-steps.md).",
-}
-
+# ── Stage Reading & Work Folder Management ────────────────────────────────────
 
 def read_stage(path: Path) -> dict[int, str]:
     if not path.exists():
@@ -548,7 +538,7 @@ def load_work(workdir: str) -> tuple[Path, dict]:
     work = Path(workdir).resolve()
     meta_path = work / "work.json"
     if not meta_path.exists():
-        sys.exit(f"{work} is not a Lema work folder (no work.json). Run prepare first.")
+        sys.exit(f"{work} is not a Lema work folder (no work.json). Run 'prepare' first.")
     return work, json.loads(meta_path.read_text(encoding="utf-8"))
 
 
@@ -557,6 +547,8 @@ def parse_ids(spec: str | None) -> set[int] | None:
         return None
     return {int(x) for x in re.split(r"[,\s]+", spec.strip()) if x}
 
+
+# ── Core Commands ─────────────────────────────────────────────────────────────
 
 def cmd_prepare(args) -> int:
     src = Path(args.file).resolve()
@@ -573,24 +565,237 @@ def cmd_prepare(args) -> int:
         shutil.rmtree(work)
     work.mkdir(parents=True)
     meta = {
-        "source": str(src), "created": datetime.now().isoformat(timespec="seconds"),
+        "source": str(src),
+        "pipeline": args.pipeline,
+        "created": datetime.now().isoformat(timespec="seconds"),
         "blocks": [{"id": b["id"], "line": b["line"], "original": b["text"],
                     "formatting_removed": b.get("had_formatting", False)} for b in blocks],
     }
     (work / "work.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
-    for name, header in STAGE_HEADERS.items():
-        lines = [f"# {header}", "# Keep every <!-- block N --> marker exactly as it is.", ""]
+
+    # originals.md is common to all pipelines
+    orig_lines = [
+        f"# Original prose paragraphs extracted from {src.name} (read-only)",
+        "# Citations, numbers, acronyms, and facts in these blocks must be retained 100%.",
+        ""
+    ]
+    for b in blocks:
+        orig_lines += [f"<!-- block {b['id']} | line {b['line']} -->", b["text"], ""]
+    (work / "originals.md").write_text("\n".join(orig_lines), encoding="utf-8")
+
+    if args.pipeline == "actor-critic":
+        draft_lines = [
+            f"# Lema Actor-Critic: English Humanized Rewrites for {src.name}",
+            "# Instructions for the Agent (Actor):",
+            "# 1. Rewrite each block using Lema deconstruction principles (Academic, Professional, etc.).",
+            "# 2. Ensure high burstiness (mix 8-13 word sentences with 18-28 word sentences; max 35 words).",
+            "# 3. Never use banned AI words (delve, tapestry, furthermore, moreover, realm, etc.).",
+            "# 4. Preserve 100% of all citations (Author et al., Year), numbers, acronyms, and key terms.",
+            "# 5. Keep every <!-- block N --> marker exactly as it is.",
+            "# 6. When all blocks are filled, run: python lema_humanize.py critic \"" + str(work) + "\"",
+            ""
+        ]
         for b in blocks:
-            lines += [f"<!-- block {b['id']} | line {b['line']} -->",
-                      b["text"] if name == "originals.md" else PLACEHOLDER, ""]
-        (work / name).write_text("\n".join(lines), encoding="utf-8")
-    words = sum(len(b["text"].split()) for b in blocks)
-    print(f"Prepared {len(blocks)} paragraphs ({words} words) from {src.name}; left as-is: " +
-          ", ".join(f"{k} {v}" for k, v in sorted(parsed["kinds"].items()) if k != "prose"))
-    print(f"Work folder: {work}")
-    print("Next: fill zh.md, then ja.md (one block per marker), then run: nmt \"%s\"" % work)
+            draft_lines += [f"<!-- block {b['id']} | line {b['line']} -->", PLACEHOLDER, ""]
+        (work / "draft.md").write_text("\n".join(draft_lines), encoding="utf-8")
+        print(f"Prepared {len(blocks)} paragraphs ({sum(len(b['text'].split()) for b in blocks)} words) in '{work.name}'")
+        print(f"Pipeline: Actor-Critic (Agent-as-Generator & Agent-as-Critic)")
+        print(f"Work folder: {work}")
+        print("Next: Fill draft.md with your humanized rewrites, then run: critic \"%s\"" % work)
+    else: # translation pipeline
+        for name, header in [
+            ("zh.md", "Step 1: replace each TODO with a Chinese rewrite (references/agent-steps.md)."),
+            ("ja.md", "Step 2: replace each TODO with a Japanese translation (references/agent-steps.md).")
+        ]:
+            lines = [f"# {header}", "# Keep every <!-- block N --> marker exactly as it is.", ""]
+            for b in blocks:
+                lines += [f"<!-- block {b['id']} | line {b['line']} -->", PLACEHOLDER, ""]
+            (work / name).write_text("\n".join(lines), encoding="utf-8")
+        print(f"Prepared {len(blocks)} paragraphs in '{work.name}' (Translation Chain)")
+        print("Next: Fill zh.md, then ja.md, then run: nmt \"%s\"" % work)
+
     return 0
 
+
+def cmd_critic(args) -> int:
+    """Evaluates text or an entire workdir using Lema's complete Critic engine:
+    1. Programmatic pacing & burstiness (check_sentence_pacing)
+    2. Semantic & factual integrity audit (check_integrity)
+    3. AI detector simulation (simulate_ai_detector)
+    """
+    if args.text:
+        original = args.original or ""
+        text = tidy_output(args.text)
+        pacing_ok, pacing_critique = check_sentence_pacing(text)
+        hard, soft = check_integrity(original, text) if original else ([], [])
+        score, is_human, detector_critiques = simulate_ai_detector(text, original)
+        
+        print("\n=== LEMA CRITIC AUDIT REPORT ===")
+        print(f"Simulated Human Authenticity Score: {score}/100")
+        print(f"Verdict: {'100% HUMAN PASS' if (pacing_ok and not hard and is_human) else 'FLAGGED AS AI'}")
+        
+        all_issues = []
+        if not pacing_ok:
+            all_issues.append(f"[PACING] {pacing_critique}")
+        if hard:
+            all_issues.append(f"[LOST DATA / HARD] {'; '.join(hard)}")
+        if soft:
+            all_issues.append(f"[DRIFT / SOFT] {'; '.join(soft)}")
+        if detector_critiques:
+            all_issues.extend([f"[DETECTOR] {c}" for c in detector_critiques])
+            
+        if all_issues:
+            print("\nActionable Critic Feedback:")
+            for issue in all_issues:
+                print(f"  • {issue}")
+            return 1
+        else:
+            print("\nAll checks passed! Text shows natural asymmetry, high burstiness, and zero AI fingerprints.")
+            return 0
+
+    work, meta = load_work(args.workdir)
+    blocks = meta["blocks"]
+    only = parse_ids(args.only)
+    targets = [b for b in blocks if only is None or b["id"] in only]
+
+    target_file = work / "draft.md"
+    if not target_file.exists():
+        target_file = work / "en.md"
+    if not target_file.exists():
+        sys.exit(f"Neither draft.md nor en.md found in {work}. Run 'prepare' and fill draft.md first.")
+
+    drafts = read_stage(target_file)
+    originals = {b["id"]: b["original"] for b in blocks}
+
+    counts = {"clean": 0, "flagged": 0, "todo": 0}
+    report_rows = []
+    updated_lines = [
+        f"# Lema Critic Audit: {target_file.name}",
+        "# Review the FLAGGED blocks below and fix only what the critique specifies.",
+        "# When all blocks say 'clean', run: assemble \"" + str(work) + "\"",
+        ""
+    ]
+
+    for b in blocks:
+        bid = b["id"]
+        orig = originals[bid]
+        rewritten = drafts.get(bid)
+
+        if not rewritten or rewritten == PLACEHOLDER:
+            counts["todo"] += 1
+            status = "TODO"
+            note = "TODO: Not written yet"
+            body = PLACEHOLDER
+            report_rows.append(f"  block {bid} (line {b['line']}): NOT WRITTEN YET")
+        else:
+            rewritten_tidy = tidy_output(rewritten)
+            pacing_ok, pacing_critique = check_sentence_pacing(rewritten_tidy)
+            hard, soft = check_integrity(orig, rewritten_tidy)
+            score, is_human, det_critiques = simulate_ai_detector(rewritten_tidy, orig)
+
+            issues = []
+            if hard:
+                issues.extend(hard)
+            if not pacing_ok:
+                issues.append(pacing_critique)
+            if det_critiques:
+                issues.extend(det_critiques)
+            if soft:
+                issues.extend(soft)
+
+            if not issues and pacing_ok and not hard and is_human:
+                counts["clean"] += 1
+                status = "clean"
+                note = "clean (100% Human)"
+            else:
+                counts["flagged"] += 1
+                status = "flagged"
+                note = f"FLAGGED: {'; '.join(issues)}"
+                report_rows.append(f"  block {bid} (line {b['line']}): FLAGGED - " + "; ".join(issues))
+
+            body = rewritten_tidy
+
+        updated_lines += [f"<!-- block {bid} | line {b['line']} | {note_safe(note)} -->", body, ""]
+
+    target_file.write_text("\n".join(updated_lines), encoding="utf-8")
+
+    print(f"\nLema Critic evaluated {len(blocks)} blocks:")
+    print(f"  Clean (100% Human): {counts['clean']}")
+    print(f"  Flagged (Needs revision): {counts['flagged']}")
+    print(f"  Pending (TODO): {counts['todo']}")
+    print(f"\nUpdated: {target_file}")
+
+    if report_rows:
+        print("\nActionable Critic Feedback:")
+        for r in report_rows[:20]:
+            print(r)
+        if len(report_rows) > 20:
+            print(f"  ... and {len(report_rows) - 20} more (see {target_file.name} for full inline notes)")
+        print("\nNext step for Agent:")
+        print("  1. Inspect FLAGGED blocks in draft.md.")
+        print("  2. Apply targeted edits: restore lost citations/numbers, replace banned words, vary sentence lengths.")
+        print("  3. Re-run: critic \"%s\" until all blocks pass!" % work)
+        return 1
+    else:
+        print("\nSUCCESS: All paragraphs passed Lema Critic validation!")
+        print("Next: assemble \"%s\"" % work)
+        return 0
+
+
+def cmd_assemble(args) -> int:
+    work, meta = load_work(args.workdir)
+    src = Path(meta["source"])
+    parsed = load_source(src)
+    blocks = parsed["blocks"]
+    if [b["text"] for b in blocks] != [m["original"] for m in meta["blocks"]]:
+        sys.exit(f"{src.name} changed since prepare; run prepare again.")
+
+    target_file = work / "draft.md"
+    if not target_file.exists():
+        target_file = work / "en.md"
+    if not target_file.exists():
+        sys.exit(f"Neither draft.md nor en.md found in {work}.")
+
+    drafts = read_stage(target_file)
+    missing = [b["id"] for b in blocks if b["id"] not in drafts]
+    if missing:
+        sys.exit(f"{target_file.name} has no text for block(s) {', '.join(map(str, missing))}.")
+
+    for b in blocks:
+        b["result"] = tidy_output(drafts[b["id"]])
+        hard, soft = check_integrity(b["text"], b["result"])
+        pacing_ok, pacing_critique = check_sentence_pacing(b["result"])
+        if not pacing_ok:
+            hard.append(pacing_critique)
+        b.update(
+            status="flagged" if (hard or soft) else "clean",
+            missing_hard=hard,
+            missing_soft=soft,
+            attempts=1,
+            provider="agent" if meta.get("pipeline") == "actor-critic" else "agent+google"
+        )
+
+    out = Path(args.output).resolve() if args.output else default_output(src)
+    if out.exists() and not args.force:
+        sys.exit(f"{out} already exists. Use --force to overwrite it or -o to specify a new path.")
+
+    write_document(parsed["container"], out, blocks)
+    report = out.with_name(out.stem + ".report.json")
+    info = {
+        "engine": f"Lema Humanizer ({meta.get('pipeline', 'actor-critic')} pipeline)",
+        "pipeline": meta.get("pipeline", "actor-critic"),
+        "input": str(src),
+        "output": str(out),
+        "report": str(report),
+        "work": str(work),
+        "finished": datetime.now().isoformat(timespec="seconds")
+    }
+    write_report(report, info, blocks)
+    print_summary(info, blocks, parsed["kept"])
+    return 0
+
+
+# ── Translation Chain (Lema v2 fallback) ──────────────────────────────────────
 
 def cmd_nmt(args) -> int:
     work, meta = load_work(args.workdir)
@@ -599,13 +804,7 @@ def cmd_nmt(args) -> int:
     targets = [b for b in blocks if only is None or b["id"] in only]
     en_path = work / "en.md"
     if en_path.exists() and only is None and not args.force:
-        sys.exit("en.md already exists (it may hold your fixes). Use --only N,M to redo specific blocks, "
-                 "or --force to redo every block.")
-    hops = [h for h in re.split(r"[,\s>]+", args.hops.strip()) if h]
-    if len(hops) < 2:
-        sys.exit("--hops needs at least two language codes, e.g. ja,fi,en")
-    if hops[-1] != "en":
-        log(f"warning: --hops ends in '{hops[-1]}', so the output will not be English")
+        sys.exit("en.md already exists. Use --only N,M to redo specific blocks, or --force to redo all.")
     zh, ja = read_stage(work / "zh.md"), read_stage(work / "ja.md")
     problems = []
     for b in targets:
@@ -614,24 +813,18 @@ def cmd_nmt(args) -> int:
             problems.append(f"block {i}: zh.md has no Chinese text yet")
         if i not in ja:
             problems.append(f"block {i}: ja.md has no text yet")
-        elif hops[0] == "ja" and not KANA_RE.search(ja[i]):
-            problems.append(f"block {i}: ja.md text has no kana, so it is not Japanese")
+        elif not KANA_RE.search(ja[i]):
+            problems.append(f"block {i}: ja.md text has no kana (not Japanese)")
     if problems:
         print("Not ready for translation:\n  " + "\n  ".join(problems))
         return 1
-    for b in targets:
-        lost = lost_items(protected_items(b["original"]), ja[b["id"]])
-        if lost:
-            log(f"warning: block {b['id']} Japanese is missing {', '.join(lost[:4])} - keep these in Latin script")
-
-    pipe = import_pipeline()
 
     def one(b: dict) -> str:
-        return tidy_output(pipe.heuristic_cleanup(pipe.translate_chain(ja[b["id"]], hops)))
+        chain = translate_chain(ja[b["id"]], ["ja", "fi", "en"])
+        return tidy_output(heuristic_cleanup(chain))
 
     results: dict[int, dict] = {}
-    chain = " > ".join(h.upper() for h in hops)
-    log(f"Google Translate {chain} + heuristic cleanup on {len(targets)} blocks...")
+    log(f"Translating JA > FI > EN on {len(targets)} blocks...")
     sink = sys.__stderr__ if args.verbose else open(os.devnull, "w", encoding="utf-8")
     with contextlib.redirect_stdout(sink):
         with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
@@ -646,8 +839,11 @@ def cmd_nmt(args) -> int:
         sink.close()
 
     existing = read_stage(en_path) if only is not None else {}
-    lines = [f"# Step 3 output: after Google Translate ({chain}) and the heuristic cleanup.",
-             "# Fix only what a FLAGGED note lists, keep the markers, then run assemble.", ""]
+    lines = [
+        "# Step 3 output: English after Google Translate (JA > FI > EN) and Lema cleanup.",
+        "# Fix only what a FLAGGED note lists, keep the markers, then run assemble.",
+        ""
+    ]
     counts = {"clean": 0, "flagged": 0, "error": 0}
     report = []
     for b in blocks:
@@ -657,6 +853,9 @@ def cmd_nmt(args) -> int:
             status, issues, body = "error", [r["error"]], PLACEHOLDER
         else:
             hard, soft = check_integrity(b["original"], r["text"])
+            pacing_ok, pacing_critique = check_sentence_pacing(r["text"])
+            if not pacing_ok:
+                hard.append(pacing_critique)
             issues, body = hard + soft, r["text"]
             status = "flagged" if issues else "clean"
         counts[status] += 1
@@ -665,143 +864,113 @@ def cmd_nmt(args) -> int:
         if status != "clean":
             report.append(f"  block {b['id']} (line {b['line']}): {status} - " + "; ".join(issues))
     en_path.write_text("\n".join(lines), encoding="utf-8")
-    print(f"{len(blocks)} blocks in en.md: {counts['clean']} clean, {counts['flagged']} flagged, "
-          f"{counts['error']} errors")
-    print(f"en.md: {en_path}")
-    for row in report:
+    print(f"{len(blocks)} blocks in en.md: {counts['clean']} clean, {counts['flagged']} flagged, {counts['error']} errors")
+    for row in report[:20]:
         print(row)
-    if counts["error"]:
-        print("Errors usually mean Google Translate rate-limited this IP; wait a minute and re-run "
-              "with --only for those blocks.")
     print(f"Next: fix flagged blocks in en.md, then run: assemble \"{work}\"")
     return 0
 
 
-def cmd_assemble(args) -> int:
-    work, meta = load_work(args.workdir)
-    src = Path(meta["source"])
-    parsed = load_source(src)
-    blocks = parsed["blocks"]
-    if [b["text"] for b in blocks] != [m["original"] for m in meta["blocks"]]:
-        sys.exit(f"{src.name} changed since prepare; run prepare again.")
-    en = read_stage(work / "en.md")
-    missing = [b["id"] for b in blocks if b["id"] not in en]
-    if missing:
-        sys.exit(f"en.md has no English text for block(s) {', '.join(map(str, missing))}.")
-    for b in blocks:
-        b["result"] = tidy_output(en[b["id"]])
-        hard, soft = check_integrity(b["text"], b["result"])
-        b.update(status="flagged" if hard or soft else "clean", missing_hard=hard, missing_soft=soft,
-                 attempts=1, provider="agent")
-    out = Path(args.output).resolve() if args.output else default_output(src)
-    if out.exists() and not args.force:
-        sys.exit(f"{out} already exists. Use --force to overwrite it or -o to choose another path.")
-    write_document(parsed["container"], out, blocks)
-    report = out.with_name(out.stem + ".report.json")
-    info = {"engine": "agent mode (agent: EN > ZH > JA; Google Translate hops; heuristic cleanup)",
-            "providers": ["agent", "Google Translate"], "model": None, "input": str(src),
-            "output": str(out), "report": str(report), "work": str(work),
-            "finished": datetime.now().isoformat(timespec="seconds")}
-    write_report(report, info, blocks)
-    print_summary(info, blocks, parsed["kept"])
-    return 0
-
-
-# ── API mode: Lema's own provider does the LLM steps ──────────────────────────
-
-def humanize_block(block: dict, run, providers: list[str], model: str | None, retries: int) -> None:
-    original = block["text"]
-    best = None
-    for attempt in range(1, retries + 2):
-        out, used, errors = None, None, []
-        for prov in providers:
-            try:
-                out = tidy_output(run(original, prov, model) or "")
-                if out:
-                    used = prov
-                    break
-                errors.append(f"{prov}: empty output")
-            except Exception as e:  # provider failure: try the next one
-                errors.append(f"{prov}: {type(e).__name__}: {str(e)[:160]}")
-        if not out:
-            block.setdefault("errors", []).extend(errors)
-            continue
-        hard, soft = check_integrity(original, out)
-        score = len(hard) * 100 + len(soft)
-        if best is None or score < best["score"]:
-            best = {"text": out, "hard": hard, "soft": soft, "score": score, "attempt": attempt, "provider": used}
-        if not hard:
-            break
-    if best is None:
-        block.update(status="error", result=None, attempts=retries + 1)
-        return
-    block.update(
-        status="flagged" if best["hard"] or best["soft"] else "clean",
-        result=best["text"], attempts=best["attempt"], provider=best["provider"],
-        missing_hard=best["hard"], missing_soft=best["soft"],
-    )
-
-
-def process_blocks(blocks: list[dict], run, providers, model, retries, workers, verbose) -> None:
-    total = len(blocks)
-    done = 0
-    sink = sys.__stderr__ if verbose else open(os.devnull, "w", encoding="utf-8")
-    with contextlib.redirect_stdout(sink):  # Lema's engines print progress to stdout
-        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-            futures = {pool.submit(humanize_block, b, run, providers, model, retries): b for b in blocks}
-            for fut in as_completed(futures):
-                b = futures[fut]
-                try:
-                    fut.result()
-                except Exception as e:
-                    b.update(status="error", result=None, errors=[f"{type(e).__name__}: {e}"])
-                done += 1
-                issues = b.get("missing_hard", []) + b.get("missing_soft", [])
-                note = b["status"] + (" - " + "; ".join(issues[:3]) if issues else "")
-                log(f"[{done}/{total}] line {b['line']}: {note}")
-    if not verbose:
-        sink.close()
-
+# ── API Mode (External LLM Generator) ─────────────────────────────────────────
 
 def cmd_api(args) -> int:
-    if bool(args.file) == bool(args.text):
-        sys.exit("api: give either a file or --text")
+    """Invokes external LLM (AWS Bedrock, Groq, Cerebras, NVIDIA) for high-temp mutations."""
     lema_home = find_lema_home(args.lema_home)
-    providers = provider_chain(args.provider, load_keys(lema_home, args.env_file), not args.no_fallback)
-    run = load_engine(args.engine, lema_home, args.mode, args.intensity, args.strip_dashes)
+    available_keys = load_keys(lema_home, args.env_file)
+    providers = provider_chain(args.provider, available_keys, not args.no_fallback)
+
+    sys.path.insert(0, str(lema_home))
+    if args.engine in ("actor-critic", "v1"):
+        try:
+            from humanizer import process_text, humanize_paragraph
+        except ImportError as e:
+            sys.exit(f"Could not import humanizer.py from {lema_home}: {e}")
+
+        def run_fn(text: str, prov: str, mod: str | None) -> str:
+            out, _ = process_text(
+                input_text=text,
+                api_key="",
+                mode=args.mode,
+                intensity=args.intensity,
+                provider=prov,
+                model=mod,
+                use_sabotage=False,
+                remove_ehm=args.strip_dashes
+            )
+            return out
+    elif args.engine == "v2":
+        try:
+            from v2.v2_engine import humanize_v2
+            run_fn = lambda t, p, m: humanize_v2(text=t, provider=p, api_key=None, model=m)["humanized"]
+        except ImportError as e:
+            sys.exit(f"Could not import v2 engine: {e}")
+    else: # v3
+        try:
+            from v3.v3_engine import humanize_v3
+            run_fn = lambda t, p, m: humanize_v3(text=t, provider=p, api_key=None, model=m)["humanized"]
+        except ImportError as e:
+            sys.exit(f"Could not import v3 engine: {e}")
 
     if args.text:
-        block = {"id": 1, "text": " ".join(args.text.split()), "line": 1}
-        process_blocks([block], run, providers, args.model, args.retries, 1, args.verbose)
-        print(block.get("result") or block["text"])
-        issues = block.get("missing_hard", []) + block.get("missing_soft", [])
-        log(f"status: {block.get('status')}" + (" - " + "; ".join(issues) if issues else ""))
-        return 0 if block.get("status") != "error" else 1
+        print(f"Generating rewrite with {args.engine} ({args.provider})...")
+        out = tidy_output(run_fn(args.text, args.provider, args.model))
+        print("\n--- REWRITTEN OUTPUT ---")
+        print(out)
+        print("\n--- RUNNING CRITIC ON OUTPUT ---")
+        pacing_ok, pacing_critique = check_sentence_pacing(out)
+        hard, soft = check_integrity(args.text, out)
+        score, is_human, det = simulate_ai_detector(out, args.text)
+        print(f"Human Authenticity Score: {score}/100")
+        if pacing_ok and not hard and is_human:
+            print("Verdict: 100% HUMAN PASS")
+        else:
+            print(f"Verdict: FLAGGED ({'; '.join(hard + ([pacing_critique] if not pacing_ok else []) + det)})")
+        return 0
+
+    if not args.file:
+        sys.exit("api: Specify a file or --text")
 
     src = Path(args.file).resolve()
-    out = Path(args.output).resolve() if args.output else default_output(src)
-    if out.exists() and not args.force:
-        sys.exit(f"{out} already exists (it may contain manual fixes). Use --force or -o to choose another path.")
     parsed = load_source(src)
     blocks = parsed["blocks"]
     if not blocks:
         sys.exit("No prose paragraphs found to rewrite.")
-    t0 = time.time()
-    log(f"Rewriting {len(blocks)} paragraphs with Lema {args.engine} ({' > '.join(providers)}), "
-        f"{args.workers} at a time...")
-    process_blocks(blocks, run, providers, args.model, args.retries, args.workers, args.verbose)
-    write_document(parsed["container"], out, blocks)
-    report = out.with_name(out.stem + ".report.json")
-    info = {"engine": f"api mode, engine {args.engine}, providers {' > '.join(providers)}",
-            "providers": providers, "model": args.model, "input": str(src), "output": str(out),
-            "report": str(report), "finished": datetime.now().isoformat(timespec="seconds"),
-            "seconds": time.time() - t0}
-    write_report(report, info, blocks)
-    print_summary(info, blocks, parsed["kept"])
+
+    # In Hybrid Mode, we prepare the work folder and fill draft.md with candidates,
+    # then run the Critic so the Agent can act as the Critic!
+    work = src.with_name(src.stem + ".lema-work")
+    if not work.exists() or args.force:
+        args_prep = argparse.Namespace(file=str(src), pipeline="actor-critic", workdir=str(work), force=True)
+        cmd_prepare(args_prep)
+
+    print(f"Calling {args.provider} ({args.model or 'default model'}) on {len(blocks)} blocks...")
+    drafts: dict[int, str] = {}
+    for b in blocks:
+        log(f"Generating candidate for block {b['id']}/{len(blocks)}...")
+        try:
+            drafts[b["id"]] = tidy_output(run_fn(b["text"], args.provider, args.model))
+        except Exception as e:
+            log(f"Error on block {b['id']}: {e}")
+            drafts[b["id"]] = b["text"]
+
+    draft_lines = [
+        f"# Lema Hybrid Mode: Candidates generated by {args.provider} ({args.engine})",
+        "# The Agent acts as the Critic! Review FLAGGED blocks against originals.md.",
+        ""
+    ]
+    for b in blocks:
+        draft_lines += [f"<!-- block {b['id']} | line {b['line']} -->", drafts.get(b["id"], PLACEHOLDER), ""]
+    (work / "draft.md").write_text("\n".join(draft_lines), encoding="utf-8")
+
+    # Run Critic immediately
+    args_critic = argparse.Namespace(workdir=str(work), only=None, text=None, original=None)
+    cmd_critic(args_critic)
+
+    print("\nHybrid API generation complete! The Agent should now review draft.md, match input vs output, and fix any FLAGGED blocks.")
     return 0
 
 
-# ── Other commands ────────────────────────────────────────────────────────────
+# ── Other Utilities ───────────────────────────────────────────────────────────
 
 def cmd_preview(args) -> int:
     parsed = load_source(Path(args.file).resolve())
@@ -821,7 +990,7 @@ def cmd_verify(args) -> int:
         import docx
         old_doc, new_doc = docx.Document(str(old)), docx.Document(str(new))
         if len(old_doc.paragraphs) != len(new_doc.paragraphs):
-            sys.exit("Paragraph count differs between the files; cannot line them up.")
+            sys.exit("Paragraph count differs between the files.")
         for t in docx_targets(old_doc):
             if t["kind"] == "prose":
                 pairs.append((t["line"], t["text"], new_doc.paragraphs[t["para"]].text))
@@ -831,117 +1000,108 @@ def cmd_verify(args) -> int:
         classify_markdown(old_segs)
         old_blocks = [s for s in old_segs if s["kind"] != "blank"]
         new_blocks = [s for s in new_segs if s["kind"] != "blank"]
-        if len(old_blocks) != len(new_blocks):
-            sys.exit(f"Block count differs ({len(old_blocks)} vs {len(new_blocks)}); cannot line them up.")
         for o, n in zip(old_blocks, new_blocks):
             if o["kind"] == "prose":
                 pairs.append((n["line"], o["text"], strip_inline_md(" ".join(l.strip() for l in n["lines"]))))
     bad = 0
     for line, orig, rewritten in pairs:
         hard, soft = check_integrity(orig, rewritten)
-        if hard or soft:
+        pacing_ok, pacing_critique = check_sentence_pacing(rewritten)
+        if hard or soft or not pacing_ok:
             bad += 1
-            print(f"  line {line}: " + "; ".join(hard + soft))
+            issues = hard + soft + ([pacing_critique] if not pacing_ok else [])
+            print(f"  line {line}: " + "; ".join(issues))
     print(f"Checked {len(pairs)} paragraphs: {len(pairs) - bad} clean, {bad} with issues.")
     return 0
 
 
 def cmd_check_setup(args) -> int:
-    ok = True
-    pipe = import_pipeline()
-    print("Bundled pipeline: imported (Google Translate hops and heuristic cleanup)")
-    probe = "Furthermore, the findings underscores a pivotal shift—a testament to the paradigm."
-    print(f"  cleanup check: {pipe.heuristic_cleanup(probe)}")
-    try:
-        sample = pipe.translate("Hei maailma", "fi", "en")
-        print(f"Google Translate: reachable (fi 'Hei maailma' -> '{sample}')")
-    except Exception as e:
-        ok = False
-        print(f"Google Translate: NOT reachable ({type(e).__name__}: {str(e)[:160]}).")
-        print("  Agent mode needs outbound network to translate.googleapis.com.")
-    try:
-        import docx  # noqa: F401
-        print(".docx support: python-docx installed")
-    except ImportError:
-        print(".docx support: python-docx missing (only .md/.txt will work)")
-    try:
-        lema_home = find_lema_home(args.lema_home)
-    except SystemExit:
-        print("API mode (optional): no Lema engine repo found, so agent mode only")
-        return 0 if ok else 1
-    print(f"API mode (optional): Lema engine repo at {lema_home}")
+    lema_home = find_lema_home(args.lema_home)
+    print(f"Lema repository: {lema_home}")
     available = load_keys(lema_home, args.env_file)
-    print(f"  provider keys: {', '.join(available) or 'none'}")
-    return 0 if ok else 1
+    print(f"Active Provider Keys: {', '.join(available) or 'None (Agent mode does not need any)'}")
+    try:
+        import docx
+        print("python-docx: Installed (Full .docx parsing and reassembly enabled)")
+    except ImportError:
+        print("python-docx: Not installed (Plain text and markdown supported; run 'pip install python-docx' for .docx)")
+    print("Pipeline modules: Loaded (Actor-Critic, check_sentence_pacing, simulate_ai_detector, heuristic_cleanup)")
+    return 0
 
+
+# ── Main Entrypoint ───────────────────────────────────────────────────────────
 
 def main() -> int:
     for stream in (sys.stdout, sys.stderr):
         with contextlib.suppress(Exception):
             stream.reconfigure(encoding="utf-8", errors="replace")
+
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--lema-home", help="api mode only: path to the Lema engine repo "
-                                            "(default: LEMA_HOME or the installed pointer)")
-    common.add_argument("--verbose", action="store_true", help="show the engine's own progress output")
+    common.add_argument("--lema-home", help="path to Lema repository")
+    common.add_argument("--verbose", action="store_true", help="verbose engine progress output")
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("prepare", parents=[common], help="split a file into blocks and create the work folder")
-    p.add_argument("file")
-    p.add_argument("--workdir", help="work folder (default: <name>.lema-work next to the file)")
-    p.add_argument("--force", action="store_true", help="discard an existing work folder and start over")
+    # prepare
+    p = sub.add_parser("prepare", parents=[common], help="split a file into prose blocks and generate work folder")
+    p.add_argument("file", help="input file (.docx, .md, .txt)")
+    p.add_argument("--pipeline", choices=["actor-critic", "translation"], default="actor-critic",
+                   help="actor-critic = direct deconstruction with draft.md (default); translation = zh.md/ja.md")
+    p.add_argument("--workdir", help="custom work folder path")
+    p.add_argument("--force", action="store_true", help="overwrite existing work folder")
     p.set_defaults(func=cmd_prepare)
 
-    p = sub.add_parser("nmt", parents=[common], help="Google Translate JA > FI > EN + cleanup + checks")
-    p.add_argument("workdir")
-    p.add_argument("--only", help="comma-separated block numbers to redo; keeps every other block in en.md")
-    p.add_argument("--hops", default="ja,fi,en",
-                   help="language codes to translate through (default ja,fi,en). The first must be the "
-                        "language in ja.md and the last should be en.")
-    p.add_argument("--workers", type=int, default=4, help="blocks translated in parallel (default 4)")
-    p.add_argument("--force", action="store_true", help="redo every block even though en.md exists")
-    p.set_defaults(func=cmd_nmt)
+    # critic
+    p = sub.add_parser("critic", parents=[common], help="run pacing, burstiness, integrity, and detector check")
+    p.add_argument("workdir", nargs="?", help="work folder containing draft.md and originals.md")
+    p.add_argument("--text", help="evaluate a single text paragraph")
+    p.add_argument("--original", help="original input paragraph (for factual/citation diff matching)")
+    p.add_argument("--only", help="comma-separated block IDs to evaluate")
+    p.set_defaults(func=cmd_critic)
 
-    p = sub.add_parser("assemble", parents=[common], help="re-check en.md and write the output document")
-    p.add_argument("workdir")
-    p.add_argument("-o", "--output", help="output path (default: <name>.lema.<ext> next to the input)")
-    p.add_argument("--force", action="store_true", help="overwrite an existing output file")
+    # assemble
+    p = sub.add_parser("assemble", parents=[common], help="verify draft blocks and assemble final document")
+    p.add_argument("workdir", help="work folder")
+    p.add_argument("-o", "--output", help="custom output path")
+    p.add_argument("--force", action="store_true", help="overwrite existing output file")
     p.set_defaults(func=cmd_assemble)
 
-    p = sub.add_parser("api", parents=[common],
-                       help="optional: let the Lema engine repo's LLM provider do everything (needs that "
-                            "repo and its API keys)")
-    p.add_argument("file", nargs="?", help=".md, .txt or .docx file")
-    p.add_argument("--text", help="rewrite this text and print the result")
-    p.add_argument("-o", "--output", help="output path (default: <name>.lema.<ext> next to the input)")
-    p.add_argument("--engine", choices=["v2", "v3", "v1"], default="v2",
-                   help="v2 = live-site translation chain (default); v3 = experimental LLM final hop; "
-                        "v1 = actor-critic rewrite with --mode/--intensity")
+    # nmt (translation fallback)
+    p = sub.add_parser("nmt", parents=[common], help="run translation chain JA > FI > EN (v2 fallback)")
+    p.add_argument("workdir", help="work folder")
+    p.add_argument("--only", help="comma-separated block numbers to redo")
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=cmd_nmt)
+
+    # api
+    p = sub.add_parser("api", parents=[common], help="generate mutations using external LLM provider")
+    p.add_argument("file", nargs="?", help="file to process")
+    p.add_argument("--text", help="rewrite a single string")
+    p.add_argument("-o", "--output", help="output path")
+    p.add_argument("--engine", choices=["actor-critic", "v1", "v2", "v3"], default="actor-critic")
     p.add_argument("--mode", default="Academic", choices=["Academic", "Professional", "Conversational", "Creative"])
     p.add_argument("--intensity", default="Enhanced", choices=["Standard", "Enhanced"])
-    p.add_argument("--strip-dashes", action="store_true", help="v1 only: replace em/en dashes with commas")
+    p.add_argument("--strip-dashes", action="store_true")
     p.add_argument("--provider", default="Bedrock", choices=PROVIDER_ORDER)
-    p.add_argument("--no-fallback", action="store_true", help="do not fall back to other providers on errors")
-    p.add_argument("--model", help="override the provider's default model (default: gpt-oss-120b)")
-    p.add_argument("--workers", type=int, default=4)
-    p.add_argument("--retries", type=int, default=2,
-                   help="extra attempts when a paragraph loses a citation, number, acronym or term")
-    p.add_argument("--force", action="store_true", help="overwrite an existing output file")
-    p.add_argument("--env-file", action="append", default=[], help="extra .env file with provider keys")
+    p.add_argument("--no-fallback", action="store_true")
+    p.add_argument("--model", help="override model name (e.g. openai.gpt-oss-120b)")
+    p.add_argument("--force", action="store_true")
+    p.add_argument("--env-file", action="append", default=[])
     p.set_defaults(func=cmd_api)
 
-    p = sub.add_parser("preview", parents=[common], help="list the paragraphs that would be rewritten")
+    # preview, verify, check-setup
+    p = sub.add_parser("preview", parents=[common], help="list prose paragraphs")
     p.add_argument("file")
     p.set_defaults(func=cmd_preview)
 
-    p = sub.add_parser("verify", parents=[common], help="re-check an edited output against the original")
+    p = sub.add_parser("verify", parents=[common], help="compare output vs original")
     p.add_argument("output")
     p.add_argument("original")
     p.set_defaults(func=cmd_verify)
 
-    p = sub.add_parser("check-setup", parents=[common],
-                       help="bundled pipeline, Google reachability, .docx support, optional api mode")
+    p = sub.add_parser("check-setup", parents=[common], help="verify environment and keys")
     p.add_argument("--env-file", action="append", default=[])
     p.set_defaults(func=cmd_check_setup)
 

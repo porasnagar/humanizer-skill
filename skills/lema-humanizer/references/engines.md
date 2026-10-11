@@ -1,25 +1,18 @@
-# Pipeline internals and checks
+# Lema engines and checks
+
+Everything is imported straight from the Lema repo, so changes there take effect on the next run.
 
 ## Agent mode (default)
 
-`prepare` / `nmt` / `assemble`. The agent running the skill does the two language steps (see
-agent-steps.md), and `nmt` uses the bundled `scripts/pipeline.py`: `translate_chain()` and
-`heuristic_cleanup()`, both ported from `v2/v2_engine.py` in the Lema project and needing no API key.
+`prepare` / `nmt` / `assemble`. The agent running the skill does v2's two LLM steps (see
+agent-steps.md), and `nmt` calls v2's own `translate_with_google()` and `heuristic_cleanup()`.
+Google Translate is keyless (the gtx endpoint, then the deep-translator scraper). In agent mode there
+is no LLM fallback when Google rate-limits: the affected blocks are marked as errors, and you re-run
+them with `--only`.
 
-Google Translate is tried on the gtx endpoint first, then the deep-translator scraper; a backend that
-returns 429 is skipped for five minutes. There is no LLM fallback, so blocks that fail are marked as
-errors in `en.md` and you re-run them with `--only`.
+## API mode: `api "<file>" --engine v2|v3|v1`
 
-`heuristic_cleanup()` output is byte-identical to Lema's original on test documents. `tidy_output()`
-in `lema_humanize.py` then removes zero-width characters, normalises non-breaking hyphens, fixes the
-" ," spacing that dash stripping leaves, and re-capitalises sentences that the cliche swap lowercased
-("Therefore" > "so").
-
-## API mode (optional): `api "<file>" --engine v2|v3|v1`
-
-Needs the separate Lema engine repo, which holds the provider calls and prompts and is not part of
-this skill. Point at it with `--lema-home`, `LEMA_HOME`, or `install.py --lema-home`. That repo's
-provider runs the whole engine; the agent only runs the command and fixes flagged blocks.
+Lema's own provider runs the whole engine; the agent only runs the command and fixes flagged blocks.
 
 ### v2 (default, live site)
 
