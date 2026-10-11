@@ -1,0 +1,8 @@
+requests>=2.28.0
+deep-translator>=1.11.4
+
+# Only needed to read or write .docx files
+python-docx>=0.8.11
+
+# Only needed for the optional `api` mode, which also needs the separate Lema engine repo
+python-dotenv>=1.0.0

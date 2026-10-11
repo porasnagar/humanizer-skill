@@ -1,0 +1,27 @@
+# Secrets - never commit these
+.env
+.env.*
+!.env.example
+*.key
+
+# The installer writes this; it is a machine-local path
+skills/lema-humanizer/lema_home.txt
+
+# Pipeline working folders and outputs
+*.lema-work/
+*.lema.md
+*.lema.docx
+*.lema.report.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Lema Humanizer"
+  short_description: "Humanize text and files with your Lema engine"
+  default_prompt: "Use $lema-humanizer to humanize this file, then fix every paragraph the report flags."
