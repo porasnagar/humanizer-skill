@@ -27,7 +27,20 @@ import requests as http_requests
 
 try:
     from dotenv import load_dotenv
+    # 1. Standard search (current working directory and upward)
     load_dotenv()
+    # 2. User home directory (~/.env)
+    home_env = Path.home() / ".env"
+    if home_env.exists():
+        load_dotenv(home_env)
+    # 3. Skill installation root
+    skill_root_env = Path(__file__).resolve().parent.parent / ".env"
+    if skill_root_env.exists():
+        load_dotenv(skill_root_env)
+    # 4. Global project locations
+    lema_env = Path.home() / "Documents" / "antigravity projects" / "Lema" / ".env"
+    if lema_env.exists():
+        load_dotenv(lema_env)
 except ImportError:
     pass
 
