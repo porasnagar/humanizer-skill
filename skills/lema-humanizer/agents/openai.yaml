@@ -1,4 +1,0 @@
-interface:
-  display_name: "Lema Humanizer"
-  short_description: "Humanize text and documents to achieve 100% human score on Copyleaks & GPTZero using Lema Actor-Critic deconstruction."
-  default_prompt: "Use $lema-humanizer to humanize this file, audit with the critic, and verify 100% human authenticity."

@@ -1,7 +1,0 @@
-{
-  "name": "lema-humanizer",
-  "displayName": "Lema Humanizer",
-  "description": "Humanizes AI text to pass Copyleaks, GPTZero, and Turnitin with 100% human score using Lema's Actor-Critic deconstruction pipeline. Supports Agent-as-AI mode (no API keys needed) and Hybrid mode (external gpt-oss-120b API with Agent as Critic).",
-  "command": "python scripts/lema_humanize.py",
-  "defaultPrompt": "Run Lema humanizer on this document: prepare the blocks, rewrite them in draft.md using high burstiness, run critic, and assemble the verified document."
-}
