@@ -59,6 +59,9 @@ except ImportError:
 # ── AI Cliches and Replacements ───────────────────────────────────────────────
 
 AI_CLICHE_REPLACEMENTS = {
+    r"\bfurthermore,\s*": "",
+    r"\bmoreover,\s*": "",
+    r"\badditionally,\s*": "",
     r"\bfurthermore\b": "also",
     r"\bmoreover\b": "also",
     r"\badditionally\b": "also",
@@ -114,6 +117,25 @@ def strip_em_dashes(text: str) -> str:
     return text.strip()
 
 
+def clean_repetitive_starters(text: str) -> str:
+    """Remove repetitive machine-translation sentence starters (so, also) that trigger GPTZero."""
+    # Strip sentence-initial 'So, ' or 'Also, '
+    text = re.sub(r'(?<=[.!?]\s)[Ss]o,\s*', '', text)
+    text = re.sub(r'(?<=[.!?]\s)[Aa]lso,\s*', '', text)
+    text = re.sub(r'\n[Ss]o,\s*', '\n', text)
+    text = re.sub(r'\n[Aa]lso,\s*', '\n', text)
+    # Ensure proper capitalization at beginning of sentences
+    lines = []
+    for line in text.splitlines():
+        if line.strip() and not line.startswith('#'):
+            # Capitalize line starter
+            line = re.sub(r'(^[a-z])', lambda m: m.group(1).upper(), line)
+            # Capitalize after sentence boundary
+            line = re.sub(r'([.!?]\s+)([a-z])', lambda m: m.group(1) + m.group(2).upper(), line)
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def replace_ai_cliches(text: str) -> str:
     """Replace typical machine-learning transition words with direct human equivalents."""
     for pattern, replacement in AI_CLICHE_REPLACEMENTS.items():
@@ -157,9 +179,11 @@ def enforce_sentence_length(text: str, max_words: int = 38) -> str:
 def heuristic_cleanup(text: str) -> str:
     """Full offline heuristic cleanup pipeline."""
     text = replace_ai_cliches(text)
+    text = clean_repetitive_starters(text)
     text = strip_em_dashes(text)
     text = enforce_sentence_length(text)
     return text.strip()
+
 
 
 # ── LLM Caller (Groq default, Bedrock fallback) ──────────────────────────────
@@ -252,7 +276,10 @@ def translate_to_chinese(text: str, provider: str = "Groq", api_key: Optional[st
         "2. REMOVE BOILERPLATE: Strip out formulaic AI transitions and clichés (e.g., 'Furthermore', 'Moreover', 'In today's "
         "digital landscape', 'In conclusion', 'delve into', 'plethora'). Do not translate these concepts; delete them entirely.\n"
         "3. ASYMMETRICAL PACING: Vary sentence lengths dramatically. Mix short, punchy Chinese sentences with longer, detailed ones.\n"
-        "4. OUTPUT ONLY THE CHINESE TRANSLATION RESULT.\n\n"
+        "4. PRESERVE CITATIONS & NAMES: NEVER translate or phonetically transliterate English author names, citations, or acronyms "
+        "(e.g., 'Benigno et al. (2022)', 'Celasun et al. (2022)', 'Blanchard and Bernanke (2023)', 'Forbes (2019)', 'GSCPI', 'CPI', 'WPI'). "
+        "Keep them in their EXACT Latin/English spelling.\n"
+        "5. OUTPUT ONLY THE CHINESE TRANSLATION RESULT.\n\n"
         f"English Text to Deconstruct and Translate:\n\"\"\"\n{text}\n\"\"\""
     )
     return call_llm(prompt, provider=provider, api_key=api_key, model=model, temperature=1.15)
@@ -268,12 +295,15 @@ def translate_chinese_to_japanese_with_history(chinese_text: str, original_engli
         "DO NOT copy the structure or formulaic transitions of the English text.\n"
         "1. Translate the Chinese text to highly natural, asymmetrical Japanese.\n"
         "2. Ensure there are absolutely NO AI clichés (like 'Furthermore', 'In conclusion').\n"
-        "3. Retain all citations, years, numbers, and technical terms accurately.\n"
+        "3. PRESERVE CITATIONS & NAMES: NEVER transliterate English author names or citations into Katakana or Kanji. "
+        "Keep all author names, citations, years, numbers, and acronyms (e.g. 'Benigno et al. (2022)', 'Celasun et al. (2022)', "
+        "'Blanchard and Bernanke (2023)', 'Carrière-Swallow et al. (2023)', 'Forbes (2019)') in their EXACT original English spelling.\n"
         "4. Output ONLY the Japanese translation.\n\n"
         f"【Original English Reference (FOR FACTUAL GROUNDING ONLY)】\n{original_english}\n\n"
         f"【Chinese Text to Translate to Japanese】\n{chinese_text}"
     )
     return call_llm(prompt, provider=provider, api_key=api_key, model=model, temperature=1.15)
+
 
 
 # ── Google NMT in 1 Go (via Google's GTX Endpoint) ───────────────────────────

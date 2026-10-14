@@ -100,22 +100,27 @@ python "<skill_dir>/scripts/engine.py" --input "<work_dir>/input.txt" --output "
 
 ---
 
-### Step 4: Agent-as-Critic Verification (Side-by-Side Review)
+### Step 4: Agent-as-Critic Verification (Surgical Fact-Check ONLY)
 
-Now, **YOU (the AI Agent) act as the Senior Editor and Critic**:
+> [!CAUTION]
+> **CRITICAL RULE: DO NOT REWRITE OR PARAPHRASE PARAGRAPHS FROM SCRATCH!**
+> The raw output from the engine (`raw_output.txt`) already has the asymmetrical, human token distribution that passes Copyleaks and GPTZero at 100% Human.
+> If YOU (the AI Agent) rewrite sentences in your own voice, you will re-inject standard LLM perplexity and turn the entire document back into **100% AI**.
+>
+> Your role as Critic is **STRICTLY SURGICAL FACT-CHECKING**:
+> 1. ✅ **Restore Dropped/Mangled Names**: If an author name was misspelled during translation (e.g. `Celasu` ➔ `Celasun`, `Kareil-Swolo` ➔ `Carrière-Swallow`, `Fukufusi` ➔ `Forbes`, `Bahnke` ➔ `Bernanke`), fix the spelling.
+> 2. ✅ **Restore Exact Citations & Numbers**: Check `critic.py` output. If any citation year (`2022`), percentage (`15.4%`), or statistic was dropped or altered, restore the exact original number.
+> 3. ✅ **Fix Translation Glitches & Acronyms**: If `Global Supply Power Index` appeared, correct it to `Global Supply Chain Pressure Index`. Keep technical acronyms (`GSCPI`, `CPI`, `WPI`, `RBI`) intact.
+> 4. ✅ **Delete Foreign Artifacts**: Remove any leftover Chinese/Japanese characters or broken punctuation.
+> 5. ❌ **NEVER REWRITE PROSE**: Keep the engine's humanized sentence structures untouched. Do not "elevate" vocabulary or add flowery transitions.
 
 1. Run the automated critic audit:
    ```bash
    python "<skill_dir>/scripts/critic.py" --original "<work_dir>/input.txt" --humanized "<work_dir>/raw_output.txt"
    ```
 
-2. Inspect the audit report and perform your manual side-by-side verification:
-   - **Discrepancy Check**: Did every author citation (`Author et al., 2022`), year, date, number, percentage, and technical acronym (`GDP`, `CPI`) survive? If any were dropped, restore them.
-   - **Hallucination Check**: Did the LLM invent any fake research, unmentioned case studies, or inaccurate claims? If so, remove them.
-   - **Untranslated Artifacts**: Are there any leftover Japanese kanji/hiragana, Chinese characters, or Finnish words? Clean them into natural English.
-   - **Clean Read & Pacing**: Read the text aloud in your context. Ensure it sounds like a published human scholar or professional—punchy, confident, varied in sentence length, with zero formulaic AI connectors (`furthermore`, `moreover`, `delve`).
+2. Perform surgical in-place replacements on `<work_dir>/raw_output.txt` for any flagged citations, numbers, or names, and write the verified text to `<work_dir>/verified.md`.
 
-3. Write the polished, verified text to `<work_dir>/verified.md`.
 
 ---
 
