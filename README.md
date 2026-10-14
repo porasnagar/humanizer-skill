@@ -18,7 +18,12 @@ You can install this skill into **any AI agent** simply by pasting this prompt i
 
 > **"Install the humanizer skill from https://github.com/porasnagar/humanizer-skill and set it up for me."**
 
-The agent will automatically clone the repository, run the installer, and register the skill in its native skills environment.
+The agent will automatically clone the repository, run the installer, and register the skill in its native environment.
+
+**What happens automatically:**
+1. A ready-to-fill `.env` file is generated inside the installed skill folder.
+2. The agent outputs the **exact skill folder path** and **`.env` file path**.
+3. You simply open that file and paste your `GROQ_API_KEY="gsk_..."`!
 
 ---
 
@@ -30,7 +35,7 @@ If you prefer to install it via your terminal:
 git clone https://github.com/porasnagar/humanizer-skill.git
 cd humanizer-skill
 
-# Install dependencies and register for all detected AI agents:
+# Install dependencies, create .env templates, and register for all detected AI agents:
 python install.py --deps
 ```
 
@@ -47,14 +52,15 @@ python install.py --workspace           # Current Project Workspace (.agents/ski
 
 ---
 
-## 🔑 Environment Configuration
+## 🔑 Environment Configuration (.env)
 
-The multi-hop deconstruction engine requires a **Groq API key** (free and fast at [console.groq.com](https://console.groq.com)):
+The installer automatically places a `.env` template directly inside the skill directory. The engine will look for `<skill_dir>/.env` automatically on every run, so you never have to worry about where you execute commands from.
 
-Add to your `.env` or export in your shell:
+Get a free, ultra-fast Groq API key at [console.groq.com](https://console.groq.com) and add it to the `.env` created by the installer:
 ```bash
 GROQ_API_KEY="gsk_..."
 ```
+
 
 *(Optional fallback: AWS Bedrock `AWS_BEDROCK_API_KEY="..."` if configured)*
 

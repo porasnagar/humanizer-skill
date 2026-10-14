@@ -11,15 +11,19 @@ Compatible across **Google Antigravity**, **Anthropic Claude Code**, **OpenAI Co
 
 ---
 
-## 1. Prerequisites & Setup
+## 1. Prerequisites, Environment & Skill Location
 
-The user must configure their **Groq API key** (or AWS Bedrock as automatic fallback):
+When you (the AI Agent) install, register, or reference this skill:
+1. **Skill & Config Path Reporting**: Provide the user with the exact folder path where this skill is located, along with the pre-created `.env` file path:
+   - **Skill Location**: `<skill_dir>`
+   - **Config File**: `<skill_dir>/.env`
+2. **Groq API Key**: The user only needs to add their free Groq API key to that `<skill_dir>/.env` file:
+   ```bash
+   GROQ_API_KEY="gsk_..."
+   ```
+   *(The multi-hop engine automatically checks `<skill_dir>/.env` first, so it works seamlessly from any terminal or working directory).*
+   *(Optional fallback: `AWS_BEDROCK_API_KEY="bedrock-..."`)*
 
-Add to `.env` or set in your environment:
-```bash
-GROQ_API_KEY="gsk_..."
-```
-*(Optional fallback: `AWS_BEDROCK_API_KEY="bedrock-..."`)*
 
 ---
 

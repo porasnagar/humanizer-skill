@@ -27,22 +27,23 @@ import requests as http_requests
 
 try:
     from dotenv import load_dotenv
-    # 1. Standard search (current working directory and upward)
-    load_dotenv()
-    # 2. User home directory (~/.env)
-    home_env = Path.home() / ".env"
-    if home_env.exists():
-        load_dotenv(home_env)
-    # 3. Skill installation root
-    skill_root_env = Path(__file__).resolve().parent.parent / ".env"
-    if skill_root_env.exists():
-        load_dotenv(skill_root_env)
-    # 4. Global project locations
-    lema_env = Path.home() / "Documents" / "antigravity projects" / "Lema" / ".env"
-    if lema_env.exists():
-        load_dotenv(lema_env)
+    # Automatically search for .env in:
+    # 1. Skill root directory (where install.py saves .env)
+    # 2. scripts/ directory
+    # 3. Current working directory
+    _script_path = Path(__file__).resolve()
+    _possible_env_paths = [
+        _script_path.parent.parent / ".env",
+        _script_path.parent / ".env",
+        Path.cwd() / ".env",
+    ]
+    for _p in _possible_env_paths:
+        if _p.is_file():
+            load_dotenv(_p, override=False)
+    load_dotenv(override=False)
 except ImportError:
     pass
+
 
 try:
     import groq
