@@ -25,6 +25,15 @@ from typing import Dict, List, Optional
 
 import requests as http_requests
 
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
+import json
+
 try:
     from dotenv import load_dotenv
     # Automatically search for .env in:
@@ -59,9 +68,6 @@ except ImportError:
 # ── AI Cliches and Replacements ───────────────────────────────────────────────
 
 AI_CLICHE_REPLACEMENTS = {
-    r"\bfurthermore,\s*": "",
-    r"\bmoreover,\s*": "",
-    r"\badditionally,\s*": "",
     r"\bfurthermore\b": "also",
     r"\bmoreover\b": "also",
     r"\badditionally\b": "also",
@@ -117,25 +123,6 @@ def strip_em_dashes(text: str) -> str:
     return text.strip()
 
 
-def clean_repetitive_starters(text: str) -> str:
-    """Remove repetitive machine-translation sentence starters (so, also) that trigger GPTZero."""
-    # Strip sentence-initial 'So, ' or 'Also, '
-    text = re.sub(r'(?<=[.!?]\s)[Ss]o,\s*', '', text)
-    text = re.sub(r'(?<=[.!?]\s)[Aa]lso,\s*', '', text)
-    text = re.sub(r'\n[Ss]o,\s*', '\n', text)
-    text = re.sub(r'\n[Aa]lso,\s*', '\n', text)
-    # Ensure proper capitalization at beginning of sentences
-    lines = []
-    for line in text.splitlines():
-        if line.strip() and not line.startswith('#'):
-            # Capitalize line starter
-            line = re.sub(r'(^[a-z])', lambda m: m.group(1).upper(), line)
-            # Capitalize after sentence boundary
-            line = re.sub(r'([.!?]\s+)([a-z])', lambda m: m.group(1) + m.group(2).upper(), line)
-        lines.append(line)
-    return "\n".join(lines)
-
-
 def replace_ai_cliches(text: str) -> str:
     """Replace typical machine-learning transition words with direct human equivalents."""
     for pattern, replacement in AI_CLICHE_REPLACEMENTS.items():
@@ -176,14 +163,138 @@ def enforce_sentence_length(text: str, max_words: int = 38) -> str:
     return " ".join(result)
 
 
+def clean_mt_artifacts(text: str) -> str:
+    """
+    Cleans Google NMT artifacts that trigger GPTZero detection:
+    - Redundant year prefixes: 'In 2022, Benigno et al. (2022)' -> 'Benigno et al. (2022)'
+    - Repetitive sentence-initial 'as a result, ', 'so, ', 'also, '
+    - Truncated MT idioms: 'This is important.' / 'It is insufficient.'
+    - Unicode non-breaking hyphens (\u2011, \u2010)
+    """
+    if not text:
+        return text
+
+    # Normalize hyphens
+    text = text.replace('\u2011', '-').replace('\u2010', '-')
+    
+    # Clean redundant year citations like 'In 2022, Benigno et al. (2022)'
+    text = re.sub(
+        r'\bIn\s+(\d{4}),\s+([A-Z][a-zA-Z\u00C0-\u024F\s\.-]+(?:\s+et\s+al\.)?\s*\(\1\))',
+        r'\2',
+        text
+    )
+
+    # Clean repetitive 'as a result, '
+    text = re.sub(r'(?<=[.!?]\s)[Aa]s a result,\s*', 'Consequently, ', text)
+    text = re.sub(r'\b,\s*and as a result\b', ', directly allowing', text)
+    text = re.sub(r'\b[Aa]s a result,\s*', '', text)
+
+    # Clean repetitive sentence-initial 'so, ' and 'also, '
+    text = re.sub(r'(?<=[.!?]\s)[Ss]o,\s*', 'Hence, ', text)
+    text = re.sub(r'(?<=[.!?]\s)[Aa]lso,\s*', 'In addition, ', text)
+    text = re.sub(r'\n[Ss]o,\s*', '\nHence, ', text)
+    text = re.sub(r'\n[Aa]lso,\s*', '\nIn addition, ', text)
+
+    # Clean formulaic MT fragments
+    text = re.sub(r'\s+This is important\.', ' This distinction is critical for empirical identification.', text)
+    text = re.sub(r'\s+This point is important\.', ' This divergent response provides key structural insight.', text)
+    text = re.sub(r'\s+It is insufficient\.', ' This metric alone remains insufficient.', text)
+
+    # Ensure proper sentence capitalization
+    lines = []
+    for line in text.splitlines():
+        if line.strip() and not line.startswith('#'):
+            line = re.sub(r'(^[a-z])', lambda m: m.group(1).upper(), line)
+            line = re.sub(r'([.!?]\s+)([a-z])', lambda m: m.group(1) + m.group(2).upper(), line)
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def stdev_sentences(text: str) -> float:
+    """Calculate standard deviation of sentence lengths in words."""
+    sents = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if len(s.split()) > 2]
+    if len(sents) < 2:
+        return 0.0
+    lengths = [len(s.split()) for s in sents]
+    mean = sum(lengths) / len(lengths)
+    return round((sum((l - mean) ** 2 for l in lengths) / len(lengths)) ** 0.5, 1)
+
+
+def sentence_lengths(text: str) -> List[int]:
+    """Return lengths of all sentences with > 2 words."""
+    return [len(s.split()) for s in re.split(r'(?<=[.!?])\s+', text) if len(s.split()) > 2]
+
+
+BRAIN_PROMPT = """You are an academic editor. The paragraph below ALREADY PASSES Copyleaks at 0% AI. Your ONLY goal is to fix machine translation artifacts, resolve broken syntax, and increase sentence-length variance so GPTZero stops flagging it as AI.
+
+STRICT CONSTRAINTS (breaking these destroys the Copyleaks score):
+- Change AT MOST 15% of the words
+- NEVER change citations (e.g. Benigno et al. (2022), Carrière-Swallow et al. (2023))
+- NEVER change acronyms (GSCPI, CPI, WPI, RBI, BDI, GVC, SVAR, NEER)
+- NEVER change any number, year, or named index
+- NEVER add transitional phrases (Furthermore, Moreover, Notably)
+- NEVER use em-dashes or double hyphens
+
+ALLOWED MICRO-EDITS (pick 2-3 maximum, not all):
+A) SPLIT one long sentence (>22 words) at a natural conjunction or comma into a punchy 6-10 word statement plus the remainder.
+B) JOIN two consecutive similar-length sentences with a semicolon.
+C) Clean formulaic MT phrases and fix any broken translation fragments.
+
+Output ONLY the edited paragraph. No explanation, no markdown, no quotes.
+
+Paragraph:
+{para}"""
+
+
+def pass2_brain_burstiness(paragraph: str, provider: str = "Groq", api_key: Optional[str] = None, model: Optional[str] = None) -> str:
+    """
+    Pass 2: Surgical micro-edit injection to eliminate GPTZero AI detection.
+    Only runs if paragraph has low sentence variance (stdev < 6.0 or span < 12).
+    Enforces a strict 35% word change safety ceiling: if exceeded, reverts to Pass 1.
+    """
+    if len(paragraph.split()) < 15:
+        return paragraph
+
+    sd_init = stdev_sentences(paragraph)
+    lens_init = sentence_lengths(paragraph)
+    
+    # If already high variance (stdev >= 6.0 and span >= 12), keep Copyleaks-perfect text
+    if sd_init >= 6.0 and lens_init and (max(lens_init) - min(lens_init) >= 12):
+        return paragraph
+
+    prompt = BRAIN_PROMPT.format(para=paragraph)
+    try:
+        raw = call_llm(prompt, provider=provider, api_key=api_key, model=model, temperature=1.05)
+        raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+        if "<think>" in raw:
+            raw = raw.split("</think>")[-1].strip()
+        result = " ".join(l.strip() for l in raw.splitlines() if l.strip())
+        
+        # Normalize non-breaking hyphens
+        result = result.replace('\u2011', '-').replace('\u2010', '-')
+
+        # Safety: revert if > 35% word change (would break Copyleaks)
+        orig_w = set(paragraph.lower().split())
+        new_w = set(result.lower().split())
+        changed = len(orig_w.symmetric_difference(new_w))
+        total = max(len(orig_w), len(new_w), 1)
+        pct = changed / total
+        if pct > 0.35:
+            print(f"[Pass 2 Brain] Reverted: {pct:.0%} word change exceeded safety ceiling (preserves Copyleaks 0% AI).", flush=True)
+            return paragraph
+        return result
+    except Exception as e:
+        print(f"[Pass 2 Brain] Warning: LLM pass 2 failed ({e}). Keeping Pass 1 text.", flush=True)
+        return paragraph
+
+
 def heuristic_cleanup(text: str) -> str:
     """Full offline heuristic cleanup pipeline."""
     text = replace_ai_cliches(text)
-    text = clean_repetitive_starters(text)
     text = strip_em_dashes(text)
     text = enforce_sentence_length(text)
+    text = clean_mt_artifacts(text)
     return text.strip()
-
 
 
 # ── LLM Caller (Groq default, Bedrock fallback) ──────────────────────────────
@@ -191,7 +302,7 @@ def heuristic_cleanup(text: str) -> str:
 def call_llm(prompt: str, provider: str = "Groq", api_key: Optional[str] = None,
              model: Optional[str] = None, temperature: float = 1.1) -> str:
     """Calls Groq (default) or Bedrock with automatic think-tag stripping and retry."""
-    max_retries = 3
+    max_retries = 6
     for attempt in range(max_retries):
         try:
             if provider.lower() == "groq":
@@ -212,10 +323,14 @@ def call_llm(prompt: str, provider: str = "Groq", api_key: Optional[str] = None,
                     temperature=temperature,
                     top_p=0.95
                 )
-                raw = resp.choices[0].message.content or ""
+                msg = resp.choices[0].message
+                raw = msg.content or ""
+                if not raw and hasattr(msg, "reasoning") and msg.reasoning:
+                    raw = msg.reasoning
                 raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
                 if "<think>" in raw:
                     raw = raw.split("</think>")[-1].strip()
+                time.sleep(0.5)
                 return raw
 
             elif provider.lower() == "bedrock":
@@ -238,10 +353,14 @@ def call_llm(prompt: str, provider: str = "Groq", api_key: Optional[str] = None,
                     max_tokens=4096,
                     top_p=1.0
                 )
-                raw = resp.choices[0].message.content or ""
+                msg = resp.choices[0].message
+                raw = msg.content or ""
+                if not raw and hasattr(msg, "reasoning") and msg.reasoning:
+                    raw = msg.reasoning
                 raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
                 if "<think>" in raw:
                     raw = raw.split("</think>")[-1].strip()
+                time.sleep(0.5)
                 return raw
 
             else:
@@ -249,8 +368,11 @@ def call_llm(prompt: str, provider: str = "Groq", api_key: Optional[str] = None,
 
         except Exception as e:
             err = str(e).lower()
+            if ("429" in err or "quota" in err or "rate" in err) and os.getenv("AWS_BEDROCK_API_KEY") and provider.lower() == "groq":
+                print(f"[Engine] Groq rate limited. Seamlessly switching to Bedrock fallback...", flush=True)
+                return call_llm(prompt, provider="Bedrock", temperature=temperature)
             if "429" in err or "quota" in err or "rate" in err:
-                wait = 20 * (attempt + 1)
+                wait = min(60, 15 * (attempt + 1))
                 print(f"[Engine] Rate limit hit. Sleeping {wait}s... (Attempt {attempt+1}/{max_retries})")
                 time.sleep(wait)
                 continue
@@ -276,10 +398,7 @@ def translate_to_chinese(text: str, provider: str = "Groq", api_key: Optional[st
         "2. REMOVE BOILERPLATE: Strip out formulaic AI transitions and clichés (e.g., 'Furthermore', 'Moreover', 'In today's "
         "digital landscape', 'In conclusion', 'delve into', 'plethora'). Do not translate these concepts; delete them entirely.\n"
         "3. ASYMMETRICAL PACING: Vary sentence lengths dramatically. Mix short, punchy Chinese sentences with longer, detailed ones.\n"
-        "4. PRESERVE CITATIONS & NAMES: NEVER translate or phonetically transliterate English author names, citations, or acronyms "
-        "(e.g., 'Benigno et al. (2022)', 'Celasun et al. (2022)', 'Blanchard and Bernanke (2023)', 'Forbes (2019)', 'GSCPI', 'CPI', 'WPI'). "
-        "Keep them in their EXACT Latin/English spelling.\n"
-        "5. OUTPUT ONLY THE CHINESE TRANSLATION RESULT.\n\n"
+        "4. OUTPUT ONLY THE CHINESE TRANSLATION RESULT.\n\n"
         f"English Text to Deconstruct and Translate:\n\"\"\"\n{text}\n\"\"\""
     )
     return call_llm(prompt, provider=provider, api_key=api_key, model=model, temperature=1.15)
@@ -295,9 +414,7 @@ def translate_chinese_to_japanese_with_history(chinese_text: str, original_engli
         "DO NOT copy the structure or formulaic transitions of the English text.\n"
         "1. Translate the Chinese text to highly natural, asymmetrical Japanese.\n"
         "2. Ensure there are absolutely NO AI clichés (like 'Furthermore', 'In conclusion').\n"
-        "3. PRESERVE CITATIONS & NAMES: NEVER transliterate English author names or citations into Katakana or Kanji. "
-        "Keep all author names, citations, years, numbers, and acronyms (e.g. 'Benigno et al. (2022)', 'Celasun et al. (2022)', "
-        "'Blanchard and Bernanke (2023)', 'Carrière-Swallow et al. (2023)', 'Forbes (2019)') in their EXACT original English spelling.\n"
+        "3. Retain all citations, years, numbers, and technical terms accurately.\n"
         "4. Output ONLY the Japanese translation.\n\n"
         f"【Original English Reference (FOR FACTUAL GROUNDING ONLY)】\n{original_english}\n\n"
         f"【Chinese Text to Translate to Japanese】\n{chinese_text}"
@@ -305,16 +422,18 @@ def translate_chinese_to_japanese_with_history(chinese_text: str, original_engli
     return call_llm(prompt, provider=provider, api_key=api_key, model=model, temperature=1.15)
 
 
+# ── Google NMT in 1 Go (via Google's GTX Endpoint with LLM Fallback) ──────────
 
-# ── Google NMT in 1 Go (via Google's GTX Endpoint) ───────────────────────────
+_GOOGLE_AVAILABLE = False  # Set to False by default if public endpoints rate-limit datacenter IPs
+
 
 def _google_gtx_translate(text: str, source: str, target: str) -> str:
-    """Google Translate via translate.googleapis.com gtx endpoint (reliable from datacenter IPs)."""
+    """Google Translate via translate.googleapis.com gtx endpoint."""
     resp = http_requests.post(
         "https://translate.googleapis.com/translate_a/single",
         params={"client": "gtx", "sl": source, "tl": target, "dt": "t"},
         data={"q": text},
-        timeout=20,
+        timeout=3,
     )
     resp.raise_for_status()
     translated = "".join(seg[0] for seg in resp.json()[0] if seg and seg[0])
@@ -323,54 +442,55 @@ def _google_gtx_translate(text: str, source: str, target: str) -> str:
     return translated
 
 
-def _google_scrape_translate(text: str, source: str, target: str) -> str:
-    """Secondary fallback: deep_translator scraper."""
-    try:
-        from deep_translator import GoogleTranslator
-        return GoogleTranslator(source=source, target=target).translate(text)
-    except Exception as e:
-        raise RuntimeError(f"Scraper fallback failed: {e}")
+def _llm_translate(text: str, source_lang: str, target_lang: str) -> str:
+    lang_names = {'ja': 'Japanese', 'fi': 'Finnish', 'en': 'English'}
+    s_name = lang_names.get(source_lang, source_lang)
+    t_name = lang_names.get(target_lang, target_lang)
+    prompt = (
+        f"You are a professional academic translator. Translate the following {s_name} text into natural, precise {t_name}. "
+        "Strictly preserve all author citations (e.g. 'Author et al., Year'), data numbers, years, percentages, and technical acronyms. "
+        f"Output ONLY the direct {t_name} translation without commentary:\n\n{text}"
+    )
+    provider = "Bedrock" if os.getenv("AWS_BEDROCK_API_KEY") else "Groq"
+    return call_llm(prompt, provider=provider, temperature=0.3)
 
 
 def translate_with_google(text: str, source: str, target: str) -> str:
-    """Step 3 & 4: Translate using Google Translate API (traditional NMT) in 1 go."""
+    """Translate using Google Translate API or LLM fallback in 1 go."""
+    global _GOOGLE_AVAILABLE
     if not text or not text.strip():
         return ""
 
-    def _call_chunk(chunk: str, retries: int = 3) -> str:
-        for attempt in range(retries):
-            # Try official gtx endpoint first
+    def _call_chunk(chunk: str) -> str:
+        global _GOOGLE_AVAILABLE
+        if _GOOGLE_AVAILABLE:
             try:
                 res = _google_gtx_translate(chunk, source, target)
                 if res and res.strip():
                     return res
-            except Exception as e_gtx:
-                pass
+            except Exception:
+                _GOOGLE_AVAILABLE = False
 
-            # Try scraper fallback
-            try:
-                res = _google_scrape_translate(chunk, source, target)
-                if res and res.strip():
-                    return res
-            except Exception as e_scrape:
-                pass
+        # Direct LLM translation
+        try:
+            res = _llm_translate(chunk, source, target)
+            if res and res.strip():
+                return res.strip()
+        except Exception as e_llm:
+            print(f"[NMT] Translation error: {e_llm}", flush=True)
 
-            if attempt < retries - 1:
-                time.sleep(3 * (attempt + 1))
-
-        print(f"[NMT] Warning: all translation backends failed for chunk. Returning original.")
         return chunk
 
-    # If text fits in 1 call (<3500 chars), send in 1 go!
-    if len(text) <= 3500:
+    # For texts <= 4000 chars, send in 1 call
+    if len(text) <= 4000:
         return _call_chunk(text)
 
-    # For longer texts, chunk into ~3500-char pieces at paragraph / sentence boundaries
+    # For longer texts, chunk into ~4000-char pieces at paragraph / sentence boundaries
     parts = [p.strip() for p in re.split(r'(?<=[.!?。！？\n])\s*', text) if p.strip()]
     chunks = []
     current = ""
     for p in parts:
-        if len(current) + len(p) + 2 > 3500:
+        if len(current) + len(p) + 2 > 4000:
             if current:
                 chunks.append(current)
             current = p
@@ -381,8 +501,7 @@ def translate_with_google(text: str, source: str, target: str) -> str:
 
     results = []
     for i, chunk in enumerate(chunks):
-        if i > 0:
-            time.sleep(0.5)  # Spacing between chunks
+        print(f"[NMT] Translating chunk {i+1}/{len(chunks)} ({source}->{target})...", flush=True)
         res = _call_chunk(chunk)
         results.append(res if res else chunk)
     return "\n\n".join(results)
@@ -391,7 +510,7 @@ def translate_with_google(text: str, source: str, target: str) -> str:
 # ── Main Humanize Entry Point ────────────────────────────────────────────────
 
 def humanize_text(text: str, provider: str = "Groq", api_key: Optional[str] = None,
-                  model: Optional[str] = None) -> Dict[str, any]:
+                  model: Optional[str] = None, cache_path: Optional[Path | str] = None) -> Dict[str, any]:
     """
     Main humanization pipeline:
       1. Robust Paragraph Splitting (splits chunks > 350 words)
@@ -436,10 +555,29 @@ def humanize_text(text: str, provider: str = "Groq", api_key: Optional[str] = No
 
     # Step 1 & 2: Paragraph by paragraph through LLM
     ja_paragraphs: List[str] = []
+    cached_map: Dict[int, str] = {}
+    c_path = Path(cache_path) if cache_path else None
+    if c_path and c_path.exists():
+        try:
+            with open(c_path, "r", encoding="utf-8") as f:
+                cached_data = json.load(f)
+                if isinstance(cached_data, dict):
+                    cached_map = {int(k): v for k, v in cached_data.items()}
+                elif isinstance(cached_data, list):
+                    cached_map = {i: v for i, v in enumerate(cached_data)}
+            print(f"[Humanizer] Loaded {len(cached_map)} cached paragraph(s) from {c_path}")
+        except Exception as e_cache:
+            print(f"[Humanizer] Warning loading cache: {e_cache}")
+
     for i, para in enumerate(paragraphs):
         # Preserve structural elements: headings, markdown formatting, bullet points
         if len(para.split()) <= 6 or para.startswith(('#', '-', '*', '•', '1.', '2.', '3.')):
             ja_paragraphs.append(para)
+            continue
+
+        if i in cached_map:
+            print(f"[Humanizer] Para {i+1}/{len(paragraphs)} (cached): Using existing translation")
+            ja_paragraphs.append(cached_map[i])
             continue
 
         print(f"[Humanizer] Para {i+1}/{len(paragraphs)} ({len(para.split())}w): Step 1 (ZH) & Step 2 (JA)...")
@@ -450,6 +588,14 @@ def humanize_text(text: str, provider: str = "Groq", api_key: Optional[str] = No
         if not ja or not ja.strip():
             ja = zh
         ja_paragraphs.append(ja)
+        cached_map[i] = ja
+        if c_path:
+            try:
+                c_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(c_path, "w", encoding="utf-8") as f:
+                    json.dump(cached_map, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
 
     combined_japanese = "\n\n".join(ja_paragraphs)
 
@@ -462,14 +608,26 @@ def humanize_text(text: str, provider: str = "Groq", api_key: Optional[str] = No
     english = translate_with_google(finnish, source='fi', target='en')
 
     # Step 5: Heuristic cleanup
-    print(f"[Humanizer] Step 5/5: Running heuristic cleanup...")
+    print(f"[Humanizer] Step 5/6: Running heuristic cleanup and MT artifact removal...")
     cleaned = heuristic_cleanup(english)
 
-    out_words = len(cleaned.split())
+    # Step 6: Pass 2 Burstiness Injection (GPTZero evasion)
+    print(f"[Humanizer] Step 6/6: Running Pass 2 Burstiness Injection (GPTZero evasion)...")
+    blocks = [b.strip() for b in cleaned.split('\n\n') if b.strip()]
+    p2_blocks = []
+    for bi, block in enumerate(blocks):
+        if block.startswith(('#', '-', '*', '•', '1.', '2.', '3.')) or len(block.split()) <= 10:
+            p2_blocks.append(block)
+            continue
+        p2_para = pass2_brain_burstiness(block, provider=provider, api_key=api_key, model=model)
+        p2_blocks.append(p2_para)
+    final_output = "\n\n".join(p2_blocks)
+
+    out_words = len(final_output.split())
     print(f"[Humanizer] Done. Output: {out_words} words.")
     return {
         "original": text,
-        "humanized": cleaned,
+        "humanized": final_output,
         "word_count": out_words,
     }
 
@@ -489,7 +647,8 @@ def main():
     with open(input_path, "r", encoding="utf-8") as f:
         text = f.read()
 
-    result = humanize_text(text, provider=args.provider)
+    cache_file = Path(args.output).with_suffix(".ja_cache.json") if args.output else None
+    result = humanize_text(text, provider=args.provider, cache_path=cache_file)
     out_text = result["humanized"]
 
     if args.output:
